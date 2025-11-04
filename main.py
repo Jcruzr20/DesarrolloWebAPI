@@ -1,0 +1,753 @@
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from uuid import UUID, uuid4
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import io 
+import random
+
+# --- LIBRERÍAS DE SEGURIDAD ---
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
+# --- 1. MODELOS DE DATOS (DTOs Y ENTIDADES DE TUS 27 DIAGRAMAS) ---
+
+# --- Modelo de Respuesta Genérico ---
+class Response(BaseModel):
+    statusCode: int = 200
+    message: str = "OK"
+    data: Optional[dict | list] = None
+
+# --- Diagrama 01: Registro Clientes ---
+class CustomerRegistrationInput(BaseModel):
+    name: str
+    email: str
+    phone: str
+    password: str
+
+class Customer(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    name: str
+    email: str
+    phone: str
+    hashed_password: str # ¡Importante! Nunca guardamos la clave en texto plano
+    createdAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 02: Validacion Correo ---
+class EmailValidationInput(BaseModel):
+    userId: UUID
+    token: str
+
+class EmailValidationToken(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    token: str
+    expiresAt: datetime
+    validatedAt: Optional[datetime] = None
+
+# --- Diagrama 03: Cuenta Usuario ---
+class UserAccountInput(BaseModel):
+    status: str # ej. "activo", "inactivo"
+
+class UserAccount(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    status: str
+    createdAt: datetime = Field(default_factory=datetime.now)
+    updatedAt: Optional[datetime] = None
+
+# --- Diagrama 04: Inicio y Cierre de Sesion ---
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
+class Session(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    token: str
+    createdAt: datetime = Field(default_factory=datetime.now)
+    expiresAt: datetime
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+# --- Diagrama 05: Recuperar Contrasena ---
+class PasswordRecoveryInput(BaseModel):
+    email: str
+
+class RecoveryToken(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    token: str
+    expiresAt: datetime
+    usedAt: Optional[datetime] = None
+
+# --- Diagrama 06: Gestion Perfil Usuario ---
+class UserProfileInput(BaseModel):
+    name: str
+    address: str
+    phone: str
+
+class UserProfile(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    name: str
+    address: str
+    phone: str
+    updatedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 07: Personalizacion de Pedidos ---
+class OrderPersonalizationInput(BaseModel):
+    # userId se obtendrá del token
+    spiceLevel: str
+    extras: List[str]
+    notes: str
+
+class OrderPreference(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    spiceLevel: str
+    extras: List[str]
+    notes: str
+
+# --- Diagrama 08: Filtrar y Buscar ---
+class SearchFilterInput(BaseModel):
+    keywords: Optional[str] = None
+    category: Optional[str] = None
+    minPrice: Optional[Decimal] = None
+    maxPrice: Optional[Decimal] = None
+    sortBy: Optional[str] = None
+
+# --- Diagrama 09: Registro de Pedidos ---
+class OrderItemInput(BaseModel):
+    productId: UUID
+    quantity: int
+
+class OrderInput(BaseModel):
+    items: List[OrderItemInput]
+    notes: Optional[str] = None
+
+class Order(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    items: List[OrderItemInput]
+    notes: Optional[str] = None
+    status: str = "pendiente"
+    createdAt: datetime = Field(default_factory=datetime.now)
+
+# Lista para almacenar pedidos (simulado)
+orders: List[Order] = []
+
+# --- Diagrama 10: Integracion Pasarela de Pago ---
+class PaymentGatewayInput(BaseModel):
+    orderId: UUID
+    amount: Decimal
+    provider: str
+    token: str # Token de la tarjeta
+
+class PaymentGateway(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    provider: str
+    transactionId: str
+    status: str
+    amount: Decimal
+
+# --- Diagrama 11: Confirmacion Automatica de Pago ---
+class PaymentConfirmationInput(BaseModel):
+    orderId: UUID
+    gatewayTransactionId: str
+
+class Payment(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    orderId: UUID
+    status: str
+    authorizationCode: str
+    confirmedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 12: Generacion de Boletas Digitales ---
+class DigitalInvoiceInput(BaseModel):
+    orderId: UUID
+
+class Invoice(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    orderId: UUID
+    number: str
+    total: Decimal
+    pdfUrl: str
+    generatedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 13: Envio de Boletas por Correo ---
+class SendInvoiceEmailInput(BaseModel):
+    invoiceId: UUID
+    email: str
+
+class InvoiceDispatch(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    invoiceId: UUID
+    email: str
+    sentAt: datetime = Field(default_factory=datetime.now)
+    status: str
+
+# --- Diagrama 14: Panel Control Cocina ---
+class KitchenPanelInput(BaseModel):
+    status: str # ej. "Pendiente", "EnPreparacion"
+
+class KitchenTicket(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    orderId: UUID
+    status: str
+    startedAt: Optional[datetime] = None
+    readyAt: Optional[datetime] = None
+
+# --- Diagrama 15: Alertas de Tiempos de Coccion ---
+class CookingTimeAlertInput(BaseModel):
+    ticketId: UUID
+    thresholdMinutes: int
+
+class CookingAlert(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    ticketId: UUID
+    thresholdMinutes: int
+    triggeredAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 16: Notificacion al Cliente ---
+class CustomerNotificationInput(BaseModel):
+    userId: UUID
+    title: str
+    message: str
+
+class Notification(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    title: str
+    message: str
+    sentAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 17: Asignacion Automatica de Repartidores ---
+class AutoDriverAssignmentInput(BaseModel):
+    orderId: UUID
+
+class Assignment(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    orderId: UUID
+    driverId: UUID
+    assignedAt: datetime = Field(default_factory=datetime.now)
+    status: str
+
+# --- Diagrama 18: Planificacion de Rutas ---
+class RoutePlanningInput(BaseModel):
+    date: datetime
+    orders: List[UUID]
+
+class RoutePlan(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    date: datetime
+    stops: int
+    optimizedBy: str
+    createdAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 19: Panel de Repartidor ---
+class CourierPanelInput(BaseModel):
+    driverId: UUID
+
+class CourierAssignmentView(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    driverId: UUID
+    orderId: UUID
+    status: str
+    updatedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 20: Seguimiento del Pedido ---
+class OrderTrackingInput(BaseModel):
+    orderId: UUID
+
+class Tracking(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    orderId: UUID
+    lat: Decimal
+    lng: Decimal
+    updatedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 21: Acumular Puntos por Compras ---
+class LoyaltyPointsInput(BaseModel):
+    userId: UUID
+    orderId: UUID
+    points: int
+
+class LoyaltyPoints(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    orderId: UUID
+    points: int
+    accruedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 22: Canjear Cupones de Descuento ---
+class RedeemCouponInput(BaseModel):
+    # userId se obtendrá del token
+    code: str
+
+class CouponRedemption(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    code: str
+    discountPct: int
+    redeemedAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 23: Recibir Promociones Personalizadas ---
+class PersonalizedPromotionInput(BaseModel):
+    segment: str
+    title: str
+    discountPct: int
+
+class Promotion(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    title: str
+    discountPct: int
+    segment: str
+    sentAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 24: Recordatorio de Promociones ---
+class PromotionReminderInput(BaseModel):
+    userId: UUID
+    title: str
+    reminderAt: datetime
+    channel: str # "email", "sms"
+
+class PromotionReminder(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    title: str
+    reminderAt: datetime
+    channel: str
+
+# --- Diagrama 25: Formularios ---
+class FormSubmissionInput(BaseModel):
+    # userId se obtendrá del token
+    type: str
+    content: str
+
+class FormSubmission(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    userId: UUID
+    type: str
+    content: str
+    createdAt: datetime = Field(default_factory=datetime.now)
+
+# --- Diagrama 26: Integracion Sistema de Datos ---
+class DataSystemIntegrationInput(BaseModel):
+    source: str
+    records: int
+
+class IntegrationJob(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    source: str
+    status: str
+    syncedAt: datetime = Field(default_factory=datetime.now)
+    records: int
+
+
+# --- 2. CONFIGURACIÓN DE SEGURIDAD ---
+# (Usaremos la misma lógica de Chocomanía)
+SECRET_KEY = "clave-secreta-pollos-abrosos"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# El tokenUrl DEBE calzar con el endpoint de login (Diagrama 04)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/pollosabroso/sesion/inicio")
+
+
+# --- 3. FUNCIONES HELPER DE SEGURIDAD ---
+def verificar_contraseña(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def hashear_contraseña(password: str) -> str:
+    return pwd_context.hash(password)
+
+def crear_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+# --- 4. "BASE DE DATOS" (temporal, en memoria) ---
+db_customers: List[Customer] = []
+db_orders: List[Order] = []
+db_payments: List[Payment] = []
+db_invoices: List[Invoice] = []
+db_kitchen_tickets: List[KitchenTicket] = []
+db_trackings: List[Tracking] = []
+db_loyalty_points: List[LoyaltyPoints] = []
+# ... (y así para las 27 entidades)
+
+
+# --- 5. FUNCIONES DE AUTENTICACIÓN Y BBDD ---
+def get_customer_by_email(email: str) -> Optional[Customer]:
+    for customer in db_customers:
+        if customer.email == email:
+            return customer
+    return None
+
+def autenticar_customer(email: str, contraseña: str) -> Optional[Customer]:
+    customer = get_customer_by_email(email)
+    if not customer:
+        return None
+    if not verificar_contraseña(contraseña, customer.hashed_password):
+        return None
+    return customer
+
+async def get_current_customer(token: str = Depends(oauth2_scheme)) -> Customer:
+    """Dependencia para proteger endpoints"""
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="No se pudieron validar las credenciales (Token inválido)",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub") # "sub" (subject) es el email
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    customer = get_customer_by_email(email)
+    if customer is None:
+        raise credentials_exception
+    return customer
+
+
+# --- 6. CREA LA APP ---
+app = FastAPI(
+    title="API Pollos Abrosos",
+    description="Implementación Monolítica de la arquitectura de servicios.",
+    version="1.0.0"
+)
+
+# Prefijo global para todos los endpoints
+API_PREFIX = "/api/pollosabroso"
+
+
+# --- 7. ENDPOINTS (API) ---
+
+@app.get("/")
+def read_root():
+    return {"mensaje": "API Gateway de Pollos Abrosos funcionando. Ve a /docs para ver los endpoints."}
+
+
+# --- Servicio: Auth (Diagramas 02, 04, 05) ---
+
+@app.post(f"{API_PREFIX}/sesion/inicio", response_model=TokenResponse, tags=["AuthService"])
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    (Diagrama 04) Iniciar Sesión.
+    Usa 'username' (para el email) y 'password'
+    """
+    customer = autenticar_customer(form_data.username, form_data.password)
+    if not customer:
+        raise HTTPException(
+            status_code=401,
+            detail="Email o contraseña incorrecta",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = crear_access_token(
+        data={"sub": customer.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post(f"{API_PREFIX}/sesion/recuperar", response_model=Response, tags=["AuthService"])
+def recover_password(input: PasswordRecoveryInput):
+    """ (Diagrama 05) Recuperar Contraseña """
+    print(f"Solicitud de recuperación para: {input.email}")
+    # Lógica de BBDD y Email (Simulada)
+    return Response(message=f"Email de recuperación enviado a {input.email}")
+
+@app.post(f"{API_PREFIX}/correo/validacion", response_model=EmailValidationToken, tags=["AuthService"])
+def validate_email(input: EmailValidationInput):
+    """ (Diagrama 02) Validar Correo """
+    print(f"Validando token {input.token} para usuario {input.userId}")
+    # Lógica de BBDD (Simulada)
+    validated_token = EmailValidationToken(
+        userId=input.userId,
+        token=input.token,
+        expiresAt=datetime.now(),
+        validatedAt=datetime.now()
+    )
+    return validated_token
+
+# --- Servicio: User (Diagramas 01, 03, 06, 21, 22) ---
+
+@app.post(f"{API_PREFIX}/clientes/registro", response_model=Customer, status_code=201, tags=["UserService"])
+def register_customer(input: CustomerRegistrationInput):
+    """ (Diagrama 01) Registro de Clientes """
+    if get_customer_by_email(input.email):
+        raise HTTPException(status_code=400, detail="El email ya está en uso")
+        
+    print(f"Registrando nuevo cliente: {input.name}")
+    
+    hashed_password = hashear_contraseña(input.password)
+    new_customer = Customer(
+        name=input.name,
+        email=input.email,
+        phone=input.phone,
+        hashed_password=hashed_password
+    )
+    db_customers.append(new_customer)
+    return new_customer
+
+@app.put(f"{API_PREFIX}/cuenta/gestion", response_model=Response, tags=["UserService"])
+def manage_account(input: UserAccountInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 03) Gestionar Cuenta de Usuario (Ej. Activar/Desactivar).
+    Endpoint protegido.
+    """
+    print(f"Usuario {current_customer.email} actualizando estado de cuenta a: {input.status}")
+    # Lógica de BBDD (Simulada)
+    return Response(message=f"Estado de cuenta actualizado")
+
+@app.put(f"{API_PREFIX}/perfil/gestion", response_model=Response, tags=["UserService"])
+def manage_profile(input: UserProfileInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 06) Gestionar Perfil de Usuario.
+    Endpoint protegido.
+    """
+    print(f"Usuario {current_customer.email} actualizando perfil.")
+    # Lógica de BBDD (Simulada)
+    current_customer.name = input.name
+    current_customer.phone = input.phone
+    # (En una BBDD real, aquí harías db.commit())
+    return Response(message=f"Perfil actualizado para {current_customer.name}")
+
+@app.post(f"{API_PREFIX}/puntos/acumular", response_model=Response, tags=["UserService"])
+def accrue_points(input: LoyaltyPointsInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 21) Acumular Puntos.
+    Endpoint protegido.
+    """
+    print(f"Añadiendo {input.points} puntos al usuario {current_customer.email} por orden {input.orderId}")
+    # Lógica de BBDD (Simulada)
+    db_loyalty_points.append(LoyaltyPoints(
+        userId=current_customer.id,
+        orderId=input.orderId,
+        points=input.points
+    ))
+    return Response(message=f"Puntos añadidos")
+
+@app.post(f"{API_PREFIX}/cupones/canjear", response_model=Response, tags=["UserService"])
+def redeem_coupon(input: RedeemCouponInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 22) Canjear Cupón.
+    Endpoint protegido.
+    """
+    print(f"Usuario {current_customer.email} intentando canjear cupón: {input.code}")
+    # Lógica de BBDD (Simulada)
+    return Response(message=f"Cupón canjeado exitosamente")
+
+# --- Servicio: Pedido/Pago (Diagramas 07, 09, 10, 11) ---
+
+@app.post(f"{API_PREFIX}/pedidos/personalizacion", response_model=Response, tags=["PedidoService"])
+def set_order_personalization(input: OrderPersonalizationInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 07) Personalización de Pedidos.
+    Endpoint protegido.
+    """
+    print(f"Guardando preferencias para {current_customer.email}: {input.notes}")
+    # Lógica de BBDD (Simulada)
+    return Response(message=f"Preferencias guardadas")
+
+@app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
+def register_order(order_input: OrderInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 09) Registro de Pedidos.
+    Endpoint protegido.
+    """
+    print(f"Registrando nuevo pedido para {current_customer.email}")
+    
+    new_order = Order(
+        userId=current_customer.id,
+        items=order_input.items,
+        notes=order_input.notes
+    )
+    
+    orders.append(new_order)  # Guardamos pedido en la "BD" simulada
+    
+    return new_order
+
+
+@app.post(f"{API_PREFIX}/pagos/integracion", response_model=Response, tags=["PagoService"])
+def integrate_payment_gateway(input: PaymentGatewayInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 10) Integración Pasarela de Pago.
+    Endpoint protegido.
+    """
+    print(f"Procesando pago de {input.amount} para orden {input.orderId} con {input.provider}")
+    # Lógica de Pasarela (Simulada)
+    return Response(data={"transactionId": f"fake_txn_{uuid.uuid4()}", "status": "approved"})
+
+@app.post(f"{API_PREFIX}/pagos/confirmacion-automatica", response_model=Response, tags=["PagoService"])
+def confirm_payment(input: PaymentConfirmationInput):
+    """
+    (Diagrama 11) Confirmación Automática de Pago (Callback).
+    Endpoint PÚBLICO (lo llama la pasarela, no el usuario).
+    """
+    print(f"Confirmando pago para orden {input.orderId} con TnxID: {input.gatewayTransactionId}")
+    # Lógica de BBDD (Simulada)
+    order = next((o for o in db_orders if o.id == input.orderId), None)
+    if order:
+        order.status = "Pagado"
+        payment = Payment(
+            orderId=input.orderId,
+            status="Confirmado",
+            authorizationCode=f"auth_{random.randint(1000, 9999)}"
+        )
+        db_payments.append(payment)
+        return Response(message=f"Orden {input.orderId} confirmada")
+    else:
+        raise HTTPException(status_code=404, detail="Orden no encontrada")
+
+# --- Servicio: Producto (Diagrama 08) ---
+
+@app.get(f"{API_PREFIX}/productos/filtrar-buscar", response_model=Response, tags=["ProductService"])
+def search_products(filter_input: SearchFilterInput = Depends()):
+    """
+    (Diagrama 08) Filtrar y Buscar Productos.
+    Usa Query Params: ?keywords=pollo&category=asado
+    """
+    print(f"Buscando productos con: {filter_input.model_dump_json(exclude_none=True)}")
+    # Lógica de BBDD (Simulada)
+    return Response(data=[
+        {"id": "fake_prod_1", "nombre": "Pollo Asado"},
+        {"id": "fake_prod_2", "nombre": "Papas Fritas"}
+    ])
+
+# --- Servicio: Operaciones (Diagramas 14, 15, 17, 18, 19, 20) ---
+
+@app.get(f"{API_PREFIX}/cocina/panel-control", response_model=List[KitchenTicket], tags=["OperacionesService"])
+def get_kitchen_panel(status: str):
+    """
+    (Diagrama 14) Panel Control Cocina.
+    Usa Query Params: ?status=Pendiente
+    """
+    print(f"Buscando tickets de cocina con estado: {status}")
+    # Lógica de BBDD (Simulada)
+    tickets = [t for t in db_kitchen_tickets if t.status == status]
+    return tickets
+
+@app.post(f"{API_PREFIX}/cocina/alertas-coccion", response_model=Response, tags=["OperacionesService"])
+def set_cooking_alert(input: CookingTimeAlertInput):
+    """ (Diagrama 15) Alertas Tiempos de Cocción """
+    print(f"Alerta creada para ticket {input.ticketId} a los {input.thresholdMinutes} min.")
+    return Response(message="Alerta creada")
+
+@app.post(f"{API_PREFIX}/reparto/asignacion-automatica", response_model=Response, tags=["OperacionesService"])
+def assign_driver(input: AutoDriverAssignmentInput):
+    """ (Diagrama 17) Asignación Automática de Repartidores """
+    print(f"Asignando repartidor a orden {input.orderId}")
+    return Response(data={"driverId": f"driver_{uuid.uuid4()}", "status": "asignado"})
+
+@app.post(f"{API_PREFIX}/reparto/planificacion-rutas", response_model=Response, tags=["OperacionesService"])
+def plan_routes(input: RoutePlanningInput):
+    """ (Diagrama 18) Planificación de Rutas """
+    print(f"Planificando rutas para {len(input.orders)} órdenes.")
+    return Response(data={"stops": len(input.orders), "optimizedBy": "simulador"})
+
+@app.get(f"{API_PREFIX}/reparto/panel", response_model=Response, tags=["OperacionesService"])
+def get_courier_panel(driverId: UUID):
+    """
+    (Diagrama 19) Panel de Repartidor.
+    Usa Query Params: ?driverId=...
+    """
+    print(f"Obteniendo panel para repartidor {driverId}")
+    return Response(data=[{"orderId": f"order_{uuid.uuid4()}", "status": "Pendiente"}])
+
+@app.get(f"{API_PREFIX}/pedidos/seguimiento", response_model=Tracking, tags=["OperacionesService"])
+def track_order(orderId: UUID):
+    """
+    (Diagrama 20) Seguimiento del Pedido.
+    Usa Query Params: ?orderId=...
+    """
+    print(f"Obteniendo seguimiento para orden {orderId}")
+    # Lógica de BBDD (Simulada)
+    tracking_data = Tracking(
+        orderId=orderId,
+        lat=Decimal("-33.456") + Decimal(random.uniform(-0.01, 0.01)),
+        lng=Decimal("-70.678") + Decimal(random.uniform(-0.01, 0.01)),
+        updatedAt=datetime.now()
+    )
+    db_trackings.append(tracking_data)
+    return tracking_data
+
+# --- Servicio: Notificacion (Diagramas 13, 16, 23, 24) ---
+
+@app.post(f"{API_PREFIX}/boletas/envio", response_model=Response, tags=["NotificationService"])
+def send_invoice_email(input: SendInvoiceEmailInput):
+    """ (Diagrama 13) Envio de Boletas por Correo """
+    print(f"Enviando boleta {input.invoiceId} a {input.email}")
+    return Response(message="Boleta enviada")
+
+@app.post(f"{API_PREFIX}/notificaciones/cliente", response_model=Response, tags=["NotificationService"])
+def send_customer_notification(input: CustomerNotificationInput):
+    """ (Diagrama 16) Notificacion al Cliente """
+    print(f"Enviando notificación '{input.title}' a {input.userId}")
+    return Response(message="Notificación enviada")
+
+@app.post(f"{API_PREFIX}/promociones/recibir", response_model=Response, tags=["NotificationService"])
+def send_personalized_promo(input: PersonalizedPromotionInput):
+    """ (Diagrama 23) Recibir Promociones Personalizadas """
+    print(f"Enviando promo '{input.title}' a segmento {input.segment}")
+    return Response(message="Promoción enviada")
+
+@app.post(f"{API_PREFIX}/promociones/recordatorio", response_model=Response, tags=["NotificationService"])
+def send_promo_reminder(input: PromotionReminderInput):
+    """ (Diagrama 24) Recordatorio de Promociones """
+    print(f"Programando recordatorio '{input.title}' para {input.userId} en canal {input.channel}")
+    return Response(message="Recordatorio programado")
+
+# --- Servicio: Documento (Diagrama 12) ---
+
+@app.post(f"{API_PREFIX}/boletas/generacion", response_model=Invoice, tags=["DocumentoService"])
+def generate_invoice(input: DigitalInvoiceInput):
+    """ (Diagrama 12) Generacion de Boletas Digitales """
+    print(f"Generando boleta para orden {input.orderId}")
+    # Lógica de PDF/Facturación (Simulada)
+    order = next((o for o in db_orders if o.id == input.orderId), None)
+    if not order:
+        raise HTTPException(status_code=404, detail="Orden no encontrada")
+        
+    invoice = Invoice(
+        orderId=input.orderId,
+        number=f"B-{random.randint(1000, 9999)}",
+        total=order.total,
+        pdfUrl=f"https://storage.azure.com/boletas/{uuid.uuid4()}.pdf"
+    )
+    db_invoices.append(invoice)
+    return invoice
+
+# --- Servicio: Misc (Diagramas 25, 26) ---
+
+@app.post(f"{API_PREFIX}/formularios/enviar", response_model=Response, tags=["MiscService"])
+def submit_form(input: FormSubmissionInput, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 25) Formularios (Ej. Contacto, Reclamos).
+    Endpoint protegido.
+    """
+    print(f"Recibido formulario '{input.type}' de {current_customer.email}")
+    return Response(message="Formulario recibido")
+
+@app.post(f"{API_PREFIX}/integracion/sistema-datos", response_model=Response, tags=["MiscService"])
+def sync_data(input: DataSystemIntegrationInput):
+    """
+    (Diagrama 26) Integracion Sistema de Datos (Admin/Interno).
+    Endpoint protegido (simulación omitida).
+    """
+    print(f"Integrando {input.records} registros de {input.source}")
+    return Response(message="Integración completada")

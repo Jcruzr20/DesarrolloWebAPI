@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import HTTPBearer
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from uuid import UUID, uuid4
@@ -7,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import io 
 import random
+
+
 
 # --- LIBRERÍAS DE SEGURIDAD ---
 from passlib.context import CryptContext
@@ -356,7 +360,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # El tokenUrl DEBE calzar con el endpoint de login (Diagrama 04)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/pollosabroso/sesion/inicio")
+oauth2_scheme = HTTPBearer()
 
 
 # --- 3. FUNCIONES HELPER DE SEGURIDAD ---
@@ -403,18 +407,33 @@ def autenticar_customer(email: str, contraseña: str) -> Optional[Customer]:
         return None
     return customer
 
-async def get_current_customer(token: str = Depends(oauth2_scheme)) -> Customer:
+async def get_current_customer(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> Customer:
     """Dependencia para proteger endpoints"""
     credentials_exception = HTTPException(
         status_code=401,
         detail="No se pudieron validar las credenciales (Token inválido)",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub") # "sub" (subject) es el email
+        # Extraer el token real (string) desde el objeto HTTPAuthorizationCredentials
+        token_str = token.credentials 
+        
+        # Decodificar el JWT
+        payload = jwt.decode(token_str, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        # Extraer el email desde "sub"
+        email: str = payload.get("sub")
         if email is None:
             raise credentials_exception
+
+        # Buscar el usuario en tu BBDD simulada
+        user = next((u for u in db_customers if u.email == email), None)
+        if user is None:
+            raise credentials_exception
+
+        return user
+
     except JWTError:
         raise credentials_exception
     

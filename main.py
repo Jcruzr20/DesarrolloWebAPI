@@ -36,7 +36,8 @@ class Customer(BaseModel):
     name: str
     email: str
     phone: str
-    hashed_password: str # ¡Importante! Nunca guardamos la clave en texto plano
+    hashed_password: str  # ¡Importante! Nunca guardamos la clave en texto plano
+    emailVerified: bool = False          # ⬅ NUEVO CAMPO
     createdAt: datetime = Field(default_factory=datetime.now)
 
 # --- Diagrama 02: Validacion Correo ---
@@ -78,7 +79,7 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
-# --- Diagrama 05: Recuperar Contrasena ---
+# --- Diagrama 05: Recuperar Contrasena --- 
 class PasswordRecoveryInput(BaseModel):
     email: str
 
@@ -383,6 +384,8 @@ def crear_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 # --- 4. "BASE DE DATOS" (temporal, en memoria) ---
 db_customers: List[Customer] = []
+email_verification_tokens: dict[UUID, str] = {}
+password_recovery_codes: dict[str, str] = {}
 db_orders: List[Order] = []
 db_payments: List[Payment] = []
 db_invoices: List[Invoice] = []
@@ -483,18 +486,83 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-@app.post(f"{API_PREFIX}/sesion/recuperar", response_model=Response, tags=["AuthService"])
+@app.post(f"{API_PREFIX}/sesion/recuperar", tags=["AuthService"])
 def recover_password(input: PasswordRecoveryInput):
-    """ (Diagrama 05) Recuperar Contraseña """
-    print(f"Solicitud de recuperación para: {input.email}")
-    # Lógica de BBDD y Email (Simulada)
-    return Response(message=f"Email de recuperación enviado a {input.email}")
+    """(Diagrama 05) Recuperar Contraseña"""
+    # 1. Verificar si existe el usuario
+    customer = get_customer_by_email(input.email)
+    if not customer:
+        raise HTTPException(status_code=404, detail="No existe un usuario con ese correo")
+    
+    # 2. Generar un código
+    import random
+    code = str(random.randint(100000, 999999))
+
+    # 3. Guardar el código en memoria
+    password_recovery_codes[input.email] = code
+
+    # 4. "Enviar" el código (simulado)
+    print(f"[DEBUG] Código de recuperación para {input.email}: {code}")
+
+    # 5. Respuesta hacia Swagger
+    return {"message": "Se envió un código de verificación al correo."}
+
+
+# --- Confirmar recuperación de contraseña (validar token) ---
+class PasswordRecoveryConfirmInput(BaseModel):
+    userId: UUID
+    token: str
+
+@app.post(f"{API_PREFIX}/sesion/recuperar/validar", response_model=Response, tags=["AuthService"])
+def confirm_password_recovery(input: PasswordRecoveryConfirmInput):
+    """ (Diagrama 05) Confirmar código de recuperación """
+
+    # Buscar el token del usuario
+    for email, stored_code in password_recovery_codes.items():
+        customer = get_customer_by_email(email)
+        if customer and customer.id == input.userId and stored_code == input.token:
+
+            print(f"[DEBUG] Código validado correctamente para usuario {input.userId}")
+
+            # Marcar el código como usado (lo eliminamos)
+            del password_recovery_codes[email]
+
+            return Response(message="Código verificado correctamente")
+
+    raise HTTPException(status_code=400, detail="El código no es válido")
+
+
+
 
 @app.post(f"{API_PREFIX}/correo/validacion", response_model=EmailValidationToken, tags=["AuthService"])
 def validate_email(input: EmailValidationInput):
-    """ (Diagrama 02) Validar Correo """
+    """
+    (Diagrama 02) Validar Correo.
+    Recibe userId y token, valida el código y marca el correo como verificado.
+    """
     print(f"Validando token {input.token} para usuario {input.userId}")
-    # Lógica de BBDD (Simulada)
+
+    # 1) Buscar el cliente
+    customer = next((c for c in db_customers if c.id == input.userId), None)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    # 2) Ver si hay un código pendiente para ese usuario
+    expected_code = email_verification_tokens.get(input.userId)
+    if expected_code is None:
+        raise HTTPException(status_code=400, detail="No hay un código pendiente para este usuario")
+
+    # 3) Comparar el código
+    if expected_code != input.token:
+        raise HTTPException(status_code=400, detail="Código de verificación incorrecto")
+
+    # 4) Marcar correo como verificado
+    customer.emailVerified = True
+
+    # 5) Borrar el código ya usado
+    email_verification_tokens.pop(input.userId, None)
+
+    # 6) Devolver el token de validación (Diagrama 02)
     validated_token = EmailValidationToken(
         userId=input.userId,
         token=input.token,
@@ -503,25 +571,44 @@ def validate_email(input: EmailValidationInput):
     )
     return validated_token
 
+
 # --- Servicio: User (Diagramas 01, 03, 06, 21, 22) ---
 
 @app.post(f"{API_PREFIX}/clientes/registro", response_model=Customer, status_code=201, tags=["UserService"])
 def register_customer(input: CustomerRegistrationInput):
-    """ (Diagrama 01) Registro de Clientes """
+    """
+    (Diagrama 01) Registro de Clientes.
+    Crea un cliente nuevo y genera un código de verificación de correo.
+    """
+    # Validar email duplicado
     if get_customer_by_email(input.email):
         raise HTTPException(status_code=400, detail="El email ya está en uso")
-        
+
     print(f"Registrando nuevo cliente: {input.name}")
-    
+
+    # Hashear la contraseña
     hashed_password = hashear_contraseña(input.password)
+
+    # Crear el cliente con emailVerified=False
     new_customer = Customer(
         name=input.name,
         email=input.email,
         phone=input.phone,
-        hashed_password=hashed_password
+        hashed_password=hashed_password,
+        emailVerified=False
     )
+
     db_customers.append(new_customer)
+
+    # Generar código de verificación (simulado)
+    code = f"{random.randint(100000, 999999)}"
+    email_verification_tokens[new_customer.id] = code
+
+    # Simular "correo enviado"
+    print(f"[DEBUG] Código de verificación para {new_customer.email}: {code}")
+
     return new_customer
+
 
 @app.put(f"{API_PREFIX}/cuenta/gestion", response_model=Response, tags=["UserService"])
 def manage_account(input: UserAccountInput, current_customer: Customer = Depends(get_current_customer)):
@@ -574,33 +661,50 @@ def redeem_coupon(input: RedeemCouponInput, current_customer: Customer = Depends
 # --- Servicio: Pedido/Pago (Diagramas 07, 09, 10, 11) ---
 
 @app.post(f"{API_PREFIX}/pedidos/personalizacion", response_model=Response, tags=["PedidoService"])
-def set_order_personalization(input: OrderPersonalizationInput, current_customer: Customer = Depends(get_current_customer)):
+def set_order_personalization(
+    input: OrderPersonalizationInput,
+    current_customer: Customer = Depends(get_current_customer)
+):
     """
     (Diagrama 07) Personalización de Pedidos.
     Endpoint protegido.
     """
     print(f"Guardando preferencias para {current_customer.email}: {input.notes}")
-    # Lógica de BBDD (Simulada)
-    return Response(message=f"Preferencias guardadas")
+
+    return Response(
+        statusCode=200,
+        message="Preferencias guardadas",
+        data={}
+    )
+
+
+# BD simulada:
+orders: List[Order] = []
+
 
 @app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
-def register_order(order_input: OrderInput, current_customer: Customer = Depends(get_current_customer)):
+def register_order(
+    order_input: OrderInput,
+    current_customer: Customer = Depends(get_current_customer)
+):
     """
     (Diagrama 09) Registro de Pedidos.
     Endpoint protegido.
     """
     print(f"Registrando nuevo pedido para {current_customer.email}")
-    
+
     new_order = Order(
+        id=uuid4(),
         userId=current_customer.id,
         items=order_input.items,
-        notes=order_input.notes
+        notes=order_input.notes,
+        status="pendiente",
+        createdAt=datetime.now()
     )
-    
-    orders.append(new_order)  # Guardamos pedido en la "BD" simulada
-    
-    return new_order
 
+    orders.append(new_order)
+
+    return new_order
 
 @app.post(f"{API_PREFIX}/pagos/integracion", response_model=Response, tags=["PagoService"])
 def integrate_payment_gateway(input: PaymentGatewayInput, current_customer: Customer = Depends(get_current_customer)):

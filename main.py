@@ -802,6 +802,43 @@ def get_kitchen_panel(status: str):
     # Lógica de BBDD (Simulada)
     tickets = [t for t in db_kitchen_tickets if t.status == status]
     return tickets
+# --- Servicio: Cocina ---
+@app.post(f"{API_PREFIX}/cocina/ticket", tags=["KitchenService"], response_model=KitchenTicket)
+def generate_kitchen_ticket(
+    input: DigitalInvoiceInput,   # solo usamos orderId
+    current_customer: Customer = Depends(get_current_customer)
+):
+    """
+    (Diagrama 15) Generación de Ticket de Cocina.
+    Endpoint protegido.
+    """
+
+    # 1) Verificar que el pedido exista y pertenezca al cliente actual
+    order = get_order_for_customer(input.orderId, current_customer.id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado para este cliente")
+
+    # 2) Verificar si YA EXISTE ticket de cocina
+    existing_ticket = next(
+        (t for t in db_kitchen_tickets if t.orderId == input.orderId),
+        None
+    )
+
+    if existing_ticket:
+        print(f"[DEBUG] Ticket de cocina ya existe para pedido {input.orderId}")
+        return existing_ticket
+
+    # 3) Crear ticket nuevo
+    ticket = KitchenTicket(
+        orderId=input.orderId,
+        status="en preparación"
+    )
+
+    db_kitchen_tickets.append(ticket)
+
+    print(f"[DEBUG] Ticket generado para pedido {input.orderId}: {ticket.id}")
+
+    return ticket
 
 @app.post(f"{API_PREFIX}/cocina/alertas-coccion", response_model=Response, tags=["OperacionesService"])
 def set_cooking_alert(input: CookingTimeAlertInput):

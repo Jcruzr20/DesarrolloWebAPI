@@ -175,6 +175,7 @@ class Payment(BaseModel):
 # --- Diagrama 12: Generacion de Boletas Digitales ---
 class DigitalInvoiceInput(BaseModel):
     orderId: UUID
+    amount: Decimal
 
 class Invoice(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -402,6 +403,7 @@ def get_customer_by_email(email: str) -> Optional[Customer]:
             return customer
     return None
 
+
 def autenticar_customer(email: str, contraseña: str) -> Optional[Customer]:
     customer = get_customer_by_email(email)
     if not customer:
@@ -409,6 +411,19 @@ def autenticar_customer(email: str, contraseña: str) -> Optional[Customer]:
     if not verificar_contraseña(contraseña, customer.hashed_password):
         return None
     return customer
+
+
+def get_order_for_customer(order_id: UUID, customer_id: UUID) -> Optional[Order]:
+    """
+    Devuelve el pedido cuyo id sea 'order_id'
+    y cuyo usuario dueño sea 'customer_id'.
+    Si no lo encuentra, retorna None.
+    """
+    return next(
+        (o for o in db_orders if o.id == order_id and o.userId == customer_id),
+        None
+    )
+
 
 async def get_current_customer(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> Customer:
     """Dependencia para proteger endpoints"""
@@ -683,38 +698,61 @@ orders: List[Order] = []
 
 
 @app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
-def register_order(
-    order_input: OrderInput,
-    current_customer: Customer = Depends(get_current_customer)
-):
+def register_order(order_input: OrderInput, current_customer: Customer = Depends(get_current_customer)):
     """
     (Diagrama 09) Registro de Pedidos.
     Endpoint protegido.
     """
     print(f"Registrando nuevo pedido para {current_customer.email}")
-
+    
     new_order = Order(
-        id=uuid4(),
         userId=current_customer.id,
         items=order_input.items,
-        notes=order_input.notes,
-        status="pendiente",
-        createdAt=datetime.now()
+        notes=order_input.notes
     )
-
-    orders.append(new_order)
-
+    
+    db_orders.append(new_order)  # Ahora sí lo guardamos en la "BD" correcta
+    
     return new_order
 
-@app.post(f"{API_PREFIX}/pagos/integracion", response_model=Response, tags=["PagoService"])
-def integrate_payment_gateway(input: PaymentGatewayInput, current_customer: Customer = Depends(get_current_customer)):
+
+# -----------------------------
+# PAYMENT SERVICE (Diagrama 10)
+# -----------------------------
+
+@app.post(f"{API_PREFIX}/pagos/pasarela", tags=["PaymentService"])
+def process_payment(input: PaymentGatewayInput, current_customer: Customer = Depends(get_current_customer)):
     """
     (Diagrama 10) Integración Pasarela de Pago.
     Endpoint protegido.
     """
-    print(f"Procesando pago de {input.amount} para orden {input.orderId} con {input.provider}")
-    # Lógica de Pasarela (Simulada)
-    return Response(data={"transactionId": f"fake_txn_{uuid.uuid4()}", "status": "approved"})
+    print(f"[DEBUG] Intentando procesar pago para orden {input.orderId} y usuario {current_customer.id}")
+
+    # Buscar el pedido del cliente autenticado
+    order = next(
+        (o for o in db_orders if o.id == input.orderId and o.userId == current_customer.id),
+        None
+    )
+
+    if order is None:
+        print("[DEBUG] Pedido no encontrado en db_orders para este cliente")
+        raise HTTPException(status_code=404, detail="Pedido no encontrado para este cliente")
+
+    # Simular la pasarela de pago
+    transaction_id = f"fake_txn_{uuid4()}"
+    print(f"[DEBUG] Pago aprobado. Transacción: {transaction_id}")
+
+    # (Opcional) guardar el pago en db_payments si tienes el modelo Payment
+    # ...
+
+    return {
+        "provider": input.provider,
+        "transactionId": transaction_id,
+        "status": "aprobado",
+        "amount": input.amount
+    }
+
+
 
 @app.post(f"{API_PREFIX}/pagos/confirmacion-automatica", response_model=Response, tags=["PagoService"])
 def confirm_payment(input: PaymentConfirmationInput):
@@ -837,23 +875,55 @@ def send_promo_reminder(input: PromotionReminderInput):
 
 # --- Servicio: Documento (Diagrama 12) ---
 
-@app.post(f"{API_PREFIX}/boletas/generacion", response_model=Invoice, tags=["DocumentoService"])
-def generate_invoice(input: DigitalInvoiceInput):
-    """ (Diagrama 12) Generacion de Boletas Digitales """
-    print(f"Generando boleta para orden {input.orderId}")
-    # Lógica de PDF/Facturación (Simulada)
-    order = next((o for o in db_orders if o.id == input.orderId), None)
-    if not order:
-        raise HTTPException(status_code=404, detail="Orden no encontrada")
-        
-    invoice = Invoice(
-        orderId=input.orderId,
-        number=f"B-{random.randint(1000, 9999)}",
-        total=order.total,
-        pdfUrl=f"https://storage.azure.com/boletas/{uuid.uuid4()}.pdf"
+@app.post(f"{API_PREFIX}/facturas/generar", response_model=Invoice, tags=["InvoiceService"])
+def generate_invoice(
+    input: DigitalInvoiceInput,
+    current_customer: Customer = Depends(get_current_customer)
+):
+    """
+    (Diagrama 11/12) Generación de Boleta / Factura Digital.
+    Endpoint protegido.
+    """
+    # 1) Verificar que el pedido exista y pertenezca al cliente actual
+    order = get_order_for_customer(input.orderId, current_customer.id)
+    if order is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Pedido no encontrado para este cliente"
+        )
+
+    # 2) Verificar si ya existe una factura para este pedido
+    existing_invoice = next(
+        (inv for inv in db_invoices if inv.orderId == order.id),
+        None
     )
-    db_invoices.append(invoice)
-    return invoice
+    if existing_invoice:
+        print(f"[DEBUG] Factura ya existe para pedido {order.id}, devolviendo existente")
+        return existing_invoice
+
+    # 3) Generar número de boleta/factura
+    invoice_number = f"BOL-{datetime.now().year}-{len(db_invoices) + 1:06}"
+
+    # 4) Construir URL "fake" del PDF (simulado)
+    pdf_url = f"https://pollos-abrosos-fake-storage.local/facturas/{invoice_number}.pdf"
+
+    # 5) Crear la boleta/factura
+    new_invoice = Invoice(
+        orderId=order.id,
+        number=invoice_number,
+        total=input.amount,
+        pdfUrl=pdf_url,
+        # generatedAt se llena solo por el Field(default_factory=datetime.now)
+    )
+
+    # 6) Guardar en la "BD" en memoria
+    db_invoices.append(new_invoice)
+
+    print(f"[DEBUG] Factura generada para pedido {order.id}: {invoice_number}")
+
+    # 7) Devolver la boleta/factura generada
+    return new_invoice
+
 
 # --- Servicio: Misc (Diagramas 25, 26) ---
 

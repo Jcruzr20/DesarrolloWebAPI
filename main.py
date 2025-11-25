@@ -1020,6 +1020,7 @@ def set_cooking_alert(input: CookingTimeAlertInput):
     print(f"Alerta creada para ticket {input.ticketId} a los {input.thresholdMinutes} min.")
     return Response(message="Alerta creada")
 # --- Servicio: Tracking (Diagrama 16) ---
+
 @app.post(f"{API_PREFIX}/tracking/actualizar", response_model=Tracking, tags=["TrackingService"])
 def update_tracking(
     input: TrackingUpdateInput,
@@ -1060,30 +1061,87 @@ def update_tracking(
         print(f"[DEBUG] Tracking actualizado para pedido {input.orderId}: {tracking.status}")
 
     return tracking
-@app.get(f"{API_PREFIX}/tracking/{{orderId}}", response_model=Tracking, tags=["TrackingService"])
-def get_tracking(orderId: UUID, current_customer: Customer = Depends(get_current_customer)):
+
+API_PREFIX = "/api/pollosabroso"  # declarada solo una vez en todo el archivo
+
+@app.get(f"{API_PREFIX}/tracking/{{orderId}}", response_model=Tracking, tags=["Tracking"])
+def get_tracking(orderId: UUID, db: Session = Depends(get_db)):
     """
     (Diagrama 16) Consultar Tracking de Pedido.
-    Endpoint protegido.
+    Lee el tracking desde la base de datos (tabla tracking).
     """
 
-    tracking = next(
-        (t for t in db_trackings if t.orderId == orderId),
-        None
+    # Como order_id es String(36), comparamos con str(orderId)
+    tracking_orm = (
+        db.query(TrackingORM)
+        .filter(TrackingORM.order_id == str(orderId))
+        .order_by(TrackingORM.updated_at.desc())
+        .first()
     )
 
-    if tracking is None:
+    if not tracking_orm:
         raise HTTPException(status_code=404, detail="Tracking no encontrado")
+
+    # ORM -> Pydantic
+    tracking = Tracking(
+        id=tracking_orm.id,              # Pydantic lo convierte a UUID
+        orderId=tracking_orm.order_id,   # idem
+        status=tracking_orm.status,
+        lat=None,                        # no existen en la BD, por eso los dejamos en None
+        lng=None,
+        updatedAt=tracking_orm.updated_at,
+    )
 
     return tracking
 
 
 
 @app.post(f"{API_PREFIX}/reparto/asignacion-automatica", response_model=Response, tags=["OperacionesService"])
-def assign_driver(input: AutoDriverAssignmentInput):
-    """ (Diagrama 17) Asignación Automática de Repartidores """
-    print(f"Asignando repartidor a orden {input.orderId}")
-    return Response(data={"driverId": f"driver_{uuid.uuid4()}", "status": "asignado"})
+def assign_driver(
+    input: AutoDriverAssignmentInput,
+    db: Session = Depends(get_db)
+):
+    """
+    (Diagrama 17) Asignación Automática de Repartidores (MySQL).
+    Asigna un repartidor real al pedido y actualiza el tracking.
+    """
+    # 1) Buscar tracking del pedido
+    tracking_orm = (
+        db.query(TrackingORM)
+        .filter(TrackingORM.order_id == str(input.orderId))
+        .order_by(TrackingORM.updated_at.desc())
+        .first()
+    )
+
+    if not tracking_orm:
+        raise HTTPException(status_code=404, detail="Tracking no encontrado para ese pedido")
+
+    # 2) Buscar repartidores
+    drivers = db.query(DeliveryPersonORM).all()
+    if not drivers:
+        raise HTTPException(status_code=400, detail="No hay repartidores registrados")
+
+    # 3) Elegir uno al azar
+    chosen_driver = random.choice(drivers)
+
+    # 4) Actualizar tracking
+    tracking_orm.driver_id = chosen_driver.id
+    tracking_orm.status = "Asignado"
+    tracking_orm.updated_at = datetime.now()
+
+    db.commit()
+    db.refresh(tracking_orm)
+
+    # 5) Devolver info
+    return Response(
+        data={
+            "orderId": tracking_orm.order_id,
+            "driverId": chosen_driver.id,
+            "driverName": chosen_driver.name,
+            "status": tracking_orm.status,
+        }
+    )
+
 
 @app.post(f"{API_PREFIX}/reparto/planificacion-rutas", response_model=Response, tags=["OperacionesService"])
 def plan_routes(input: RoutePlanningInput):
@@ -1092,13 +1150,32 @@ def plan_routes(input: RoutePlanningInput):
     return Response(data={"stops": len(input.orders), "optimizedBy": "simulador"})
 
 @app.get(f"{API_PREFIX}/reparto/panel", response_model=Response, tags=["OperacionesService"])
-def get_courier_panel(driverId: UUID):
+def get_courier_panel(
+    driverId: UUID,
+    db: Session = Depends(get_db)
+):
     """
     (Diagrama 19) Panel de Repartidor.
-    Usa Query Params: ?driverId=...
+    Usa Query Param: ?driverId=...
+    Muestra todos los pedidos asignados a ese repartidor.
     """
-    print(f"Obteniendo panel para repartidor {driverId}")
-    return Response(data=[{"orderId": f"order_{uuid.uuid4()}", "status": "Pendiente"}])
+
+    trackings = db.query(TrackingORM).filter(
+        TrackingORM.driver_id == str(driverId)
+    ).all()
+
+    pedidos = []
+    for tr in trackings:
+        pedidos.append(
+            {
+                "orderId": tr.order_id,
+                "status": tr.status,
+                "updatedAt": tr.updated_at,
+            }
+        )
+
+    return Response(data=pedidos)
+
 
 @app.get(f"{API_PREFIX}/pedidos/seguimiento", response_model=Tracking, tags=["OperacionesService"])
 def track_order(orderId: UUID):

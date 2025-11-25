@@ -63,7 +63,13 @@ class Tracking(Base):
     status = Column(String(50))
     updated_at = Column(DateTime, default=datetime.now)
 
+    # NUEVO: coincide con tu columna en MySQL
+    driver_id = Column(String(36), ForeignKey("delivery_person.id"), nullable=True)
+
+    # Relaciones
     order = relationship("Order", back_populates="tracking")
+    driver = relationship("DeliveryPerson", back_populates="deliveries")
+
 
 
 # -------------------------
@@ -75,3 +81,6 @@ class DeliveryPerson(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
     name = Column(String(100))
     phone = Column(String(30))
+
+    # NUEVO: relación inversa
+    deliveries = relationship("Tracking", back_populates="driver")

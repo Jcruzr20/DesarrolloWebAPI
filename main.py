@@ -282,6 +282,7 @@ class Tracking(BaseModel):
     updatedAt: datetime = Field(default_factory=datetime.now)
 
 
+
 # --- Diagrama 21: Acumular Puntos por Compras ---
 class LoyaltyPointsInput(BaseModel):
     userId: UUID
@@ -869,13 +870,13 @@ def update_tracking(
             detail="Pedido no encontrado para este cliente"
         )
 
-    # 2) Buscar si ya existe un tracking para este pedido
+    # 2) Buscar tracking existente
     tracking = next(
         (t for t in db_trackings if t.orderId == input.orderId),
         None
     )
 
-    # 3) Si no existe, crear uno nuevo
+    # 3) Crear si no existe
     if tracking is None:
         tracking = Tracking(
             orderId=input.orderId,
@@ -883,14 +884,13 @@ def update_tracking(
         )
         db_trackings.append(tracking)
         print(f"[DEBUG] Tracking creado para pedido {input.orderId}: {tracking.status}")
+
     else:
-        # 4) Si existe, actualizar el estado
+        # 4) Actualizar
         tracking.status = input.status
-        # Si tu modelo Tracking tiene updatedAt, puedes hacer:
-        # tracking.updatedAt = datetime.now()
+        tracking.updatedAt = datetime.now()
         print(f"[DEBUG] Tracking actualizado para pedido {input.orderId}: {tracking.status}")
 
-    # 5) Devolver el tracking actual
     return tracking
 
 

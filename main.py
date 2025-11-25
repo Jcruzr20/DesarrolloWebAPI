@@ -892,6 +892,23 @@ def update_tracking(
         print(f"[DEBUG] Tracking actualizado para pedido {input.orderId}: {tracking.status}")
 
     return tracking
+@app.get(f"{API_PREFIX}/tracking/{{orderId}}", response_model=Tracking, tags=["TrackingService"])
+def get_tracking(orderId: UUID, current_customer: Customer = Depends(get_current_customer)):
+    """
+    (Diagrama 16) Consultar Tracking de Pedido.
+    Endpoint protegido.
+    """
+
+    tracking = next(
+        (t for t in db_trackings if t.orderId == orderId),
+        None
+    )
+
+    if tracking is None:
+        raise HTTPException(status_code=404, detail="Tracking no encontrado")
+
+    return tracking
+
 
 
 @app.post(f"{API_PREFIX}/reparto/asignacion-automatica", response_model=Response, tags=["OperacionesService"])

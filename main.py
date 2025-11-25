@@ -212,6 +212,9 @@ class KitchenTicket(BaseModel):
 class CookingTimeAlertInput(BaseModel):
     ticketId: UUID
     thresholdMinutes: int
+class TrackingUpdateInput(BaseModel):
+    orderId: UUID
+    status: str  # ejemplo: "en ruta", "cerca", "entregado"
 
 class CookingAlert(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -273,9 +276,11 @@ class OrderTrackingInput(BaseModel):
 class Tracking(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     orderId: UUID
-    lat: Decimal
-    lng: Decimal
+    status: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
     updatedAt: datetime = Field(default_factory=datetime.now)
+
 
 # --- Diagrama 21: Acumular Puntos por Compras ---
 class LoyaltyPointsInput(BaseModel):
@@ -845,6 +850,49 @@ def set_cooking_alert(input: CookingTimeAlertInput):
     """ (Diagrama 15) Alertas Tiempos de Cocción """
     print(f"Alerta creada para ticket {input.ticketId} a los {input.thresholdMinutes} min.")
     return Response(message="Alerta creada")
+# --- Servicio: Tracking (Diagrama 16) ---
+@app.post(f"{API_PREFIX}/tracking/actualizar", response_model=Tracking, tags=["TrackingService"])
+def update_tracking(
+    input: TrackingUpdateInput,
+    current_customer: Customer = Depends(get_current_customer)
+):
+    """
+    (Diagrama 16) Actualización de Tracking de Pedido.
+    Endpoint protegido.
+    """
+
+    # 1) Verificar que el pedido exista y pertenezca al cliente actual
+    order = get_order_for_customer(input.orderId, current_customer.id)
+    if order is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Pedido no encontrado para este cliente"
+        )
+
+    # 2) Buscar si ya existe un tracking para este pedido
+    tracking = next(
+        (t for t in db_trackings if t.orderId == input.orderId),
+        None
+    )
+
+    # 3) Si no existe, crear uno nuevo
+    if tracking is None:
+        tracking = Tracking(
+            orderId=input.orderId,
+            status=input.status
+        )
+        db_trackings.append(tracking)
+        print(f"[DEBUG] Tracking creado para pedido {input.orderId}: {tracking.status}")
+    else:
+        # 4) Si existe, actualizar el estado
+        tracking.status = input.status
+        # Si tu modelo Tracking tiene updatedAt, puedes hacer:
+        # tracking.updatedAt = datetime.now()
+        print(f"[DEBUG] Tracking actualizado para pedido {input.orderId}: {tracking.status}")
+
+    # 5) Devolver el tracking actual
+    return tracking
+
 
 @app.post(f"{API_PREFIX}/reparto/asignacion-automatica", response_model=Response, tags=["OperacionesService"])
 def assign_driver(input: AutoDriverAssignmentInput):

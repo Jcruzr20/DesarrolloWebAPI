@@ -9,6 +9,23 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import io 
 import random
+from sqlalchemy.orm import Session
+from fastapi import Depends
+
+from database import SessionLocal, engine
+from models import Base, Customer as CustomerORM, Order as OrderORM, OrderItem as OrderItemORM, Tracking as TrackingORM, DeliveryPerson as DeliveryPersonORM
+# Crear tablas si no existen (seguro aunque ya estén creadas)
+Base.metadata.create_all(bind=engine)
+
+# Dependencia para obtener la sesión de BD
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 
 
 
@@ -403,36 +420,47 @@ db_loyalty_points: List[LoyaltyPoints] = []
 
 
 # --- 5. FUNCIONES DE AUTENTICACIÓN Y BBDD ---
-def get_customer_by_email(email: str) -> Optional[Customer]:
-    for customer in db_customers:
-        if customer.email == email:
-            return customer
-    return None
+def get_customer_by_id(db: Session, customer_id: str):
+    return db.query(CustomerORM).filter(CustomerORM.id == customer_id).first()
 
+def get_customer_by_email(db: Session, email: str):
+    return db.query(CustomerORM).filter(CustomerORM.email == email).first()
 
-def autenticar_customer(email: str, contraseña: str) -> Optional[Customer]:
-    customer = get_customer_by_email(email)
-    if not customer:
-        return None
-    if not verificar_contraseña(contraseña, customer.hashed_password):
-        return None
-    return customer
-
-
-def get_order_for_customer(order_id: UUID, customer_id: UUID) -> Optional[Order]:
+def authenticate_customer(db: Session, email: str, password: str):
     """
-    Devuelve el pedido cuyo id sea 'order_id'
-    y cuyo usuario dueño sea 'customer_id'.
-    Si no lo encuentra, retorna None.
+    Autentica al cliente contra la BD MySQL.
+    Retorna el objeto CustomerORM si las credenciales son correctas,
+    o None en caso contrario.
     """
-    return next(
-        (o for o in db_orders if o.id == order_id and o.userId == customer_id),
-        None
-    )
+    user = get_customer_by_email(db, email)
+    if not user:
+        return None
+    # Verificar contraseña con bcrypt
+    if not pwd_context.verify(password, user.hashed_password):
+        return None
+    return user
 
 
-async def get_current_customer(token: HTTPAuthorizationCredentials = Depends(oauth2_scheme)) -> Customer:
-    """Dependencia para proteger endpoints"""
+
+
+def get_order_for_customer(db: Session, order_id: str, customer_id: str):
+    """
+    Busca un pedido por id que pertenezca al cliente indicado.
+    """
+    return db.query(OrderORM).filter(
+        OrderORM.id == order_id,
+        OrderORM.user_id == customer_id
+    ).first()
+
+
+async def get_current_customer(
+    token: HTTPAuthorizationCredentials = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+):
+    """
+    Obtiene el cliente actual a partir del JWT enviado en el Authorization header.
+    Funciona con HTTPBearer (token.credentials) y busca al usuario en MySQL.
+    """
     credentials_exception = HTTPException(
         status_code=401,
         detail="No se pudieron validar las credenciales (Token inválido)",
@@ -440,31 +468,28 @@ async def get_current_customer(token: HTTPAuthorizationCredentials = Depends(oau
     )
 
     try:
-        # Extraer el token real (string) desde el objeto HTTPAuthorizationCredentials
-        token_str = token.credentials 
-        
+        # Extraer el string real del token desde HTTPAuthorizationCredentials
+        token_str = token.credentials
+
         # Decodificar el JWT
         payload = jwt.decode(token_str, SECRET_KEY, algorithms=[ALGORITHM])
-        
-        # Extraer el email desde "sub"
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
+        user_id: str = payload.get("sub")
 
-        # Buscar el usuario en tu BBDD simulada
-        user = next((u for u in db_customers if u.email == email), None)
-        if user is None:
+        if user_id is None:
             raise credentials_exception
-
-        return user
 
     except JWTError:
         raise credentials_exception
-    
-    customer = get_customer_by_email(email)
-    if customer is None:
+
+    # Buscar usuario por ID en MySQL
+    user = db.query(CustomerORM).filter(CustomerORM.id == user_id).first()
+
+    if user is None:
         raise credentials_exception
-    return customer
+
+    return user
+
+
 
 
 # --- 6. CREA LA APP ---
@@ -488,24 +513,33 @@ def read_root():
 # --- Servicio: Auth (Diagramas 02, 04, 05) ---
 
 @app.post(f"{API_PREFIX}/sesion/inicio", response_model=TokenResponse, tags=["AuthService"])
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
     """
-    (Diagrama 04) Iniciar Sesión.
-    Usa 'username' (para el email) y 'password'
+    (Diagrama 04) Iniciar Sesión (versión MySQL).
+    Usa 'username' (email) y 'password'.
     """
-    customer = autenticar_customer(form_data.username, form_data.password)
+    # Autenticar contra MySQL
+    customer = authenticate_customer(db, form_data.username, form_data.password)
     if not customer:
         raise HTTPException(
             status_code=401,
             detail="Email o contraseña incorrecta",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    # Aquí el "sub" DEBE ser el id del usuario (como pide JWT)
     access_token = crear_access_token(
-        data={"sub": customer.email}, expires_delta=access_token_expires
+        data={"sub": str(customer.id)},
+        expires_delta=access_token_expires
     )
+
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 @app.post(f"{API_PREFIX}/sesion/recuperar", tags=["AuthService"])
 def recover_password(input: PasswordRecoveryInput):
@@ -596,13 +630,15 @@ def validate_email(input: EmailValidationInput):
 # --- Servicio: User (Diagramas 01, 03, 06, 21, 22) ---
 
 @app.post(f"{API_PREFIX}/clientes/registro", response_model=Customer, status_code=201, tags=["UserService"])
-def register_customer(input: CustomerRegistrationInput):
+def register_customer(input: CustomerRegistrationInput, db: Session = Depends(get_db)):
     """
     (Diagrama 01) Registro de Clientes.
     Crea un cliente nuevo y genera un código de verificación de correo.
+    Ahora guardando en MySQL.
     """
-    # Validar email duplicado
-    if get_customer_by_email(input.email):
+    # Validar email duplicado en BD
+    existing = get_customer_by_email(db, input.email)
+    if existing:
         raise HTTPException(status_code=400, detail="El email ya está en uso")
 
     print(f"Registrando nuevo cliente: {input.name}")
@@ -610,25 +646,34 @@ def register_customer(input: CustomerRegistrationInput):
     # Hashear la contraseña
     hashed_password = hashear_contraseña(input.password)
 
-    # Crear el cliente con emailVerified=False
-    new_customer = Customer(
+    # Crear el cliente en la BD
+    new_customer = CustomerORM(
         name=input.name,
         email=input.email,
         phone=input.phone,
-        hashed_password=hashed_password,
-        emailVerified=False
+        hashed_password=hashed_password
     )
 
-    db_customers.append(new_customer)
+    db.add(new_customer)
+    db.commit()
+    db.refresh(new_customer)
 
     # Generar código de verificación (simulado)
     code = f"{random.randint(100000, 999999)}"
-    email_verification_tokens[new_customer.id] = code
+    email_verification_tokens[str(new_customer.id)] = code
 
-    # Simular "correo enviado"
     print(f"[DEBUG] Código de verificación para {new_customer.email}: {code}")
 
-    return new_customer
+    # Devolver Customer Pydantic
+    return Customer(
+        id=new_customer.id,
+        name=new_customer.name,
+        email=new_customer.email,
+        phone=new_customer.phone,
+        hashed_password=new_customer.hashed_password,
+        emailVerified=False
+    )
+
 
 
 @app.put(f"{API_PREFIX}/cuenta/gestion", response_model=Response, tags=["UserService"])
@@ -704,22 +749,145 @@ orders: List[Order] = []
 
 
 @app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
-def register_order(order_input: OrderInput, current_customer: Customer = Depends(get_current_customer)):
+def register_order(
+    order_input: OrderInput,
+    current_customer: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db)
+):
     """
     (Diagrama 09) Registro de Pedidos.
-    Endpoint protegido.
+    Versión MySQL adaptada a los modelos Pydantic.
     """
     print(f"Registrando nuevo pedido para {current_customer.email}")
-    
-    new_order = Order(
-        userId=current_customer.id,
-        items=order_input.items,
-        notes=order_input.notes
+
+    # 1) Crear pedido en BD (total lo dejaremos como 0)
+    new_order = OrderORM(
+        user_id=current_customer.id,
+        total=0  # porque tu modelo no incluye precio todavía
     )
-    
-    db_orders.append(new_order)  # Ahora sí lo guardamos en la "BD" correcta
-    
-    return new_order
+    db.add(new_order)
+    db.commit()
+    db.refresh(new_order)
+
+    # 2) Registrar items en la BD
+    for item in order_input.items:
+        db_item = OrderItemORM(
+            order_id=new_order.id,
+            product_name=str(item.productId),  # guardamos productId como texto
+            quantity=item.quantity,
+            price=0  # porque tu modelo no trae precio
+        )
+        db.add(db_item)
+
+    db.commit()
+
+    # 3) Crear tracking inicial
+    tracking = TrackingORM(
+        order_id=new_order.id,
+        status="En preparación"
+    )
+    db.add(tracking)
+    db.commit()
+    db.refresh(tracking)
+
+    # 4) Devolver el pedido según tu Pydantic Order
+    return Order(
+        id=new_order.id,
+        userId=new_order.user_id,
+        items=order_input.items,
+        notes=order_input.notes,
+        status=tracking.status,
+        createdAt=new_order.created_at
+    )
+
+@app.get(f"{API_PREFIX}/pedidos/{{order_id}}", response_model=Order, tags=["PedidoService"])
+def get_order_by_id(
+    order_id: UUID,
+    current_customer: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db)
+):
+    """
+    (Diagrama 10) Obtener detalle de un pedido por ID.
+    Solo permite ver pedidos del cliente autenticado.
+    """
+    # Buscar el pedido en BD verificando que sea del usuario logueado
+    order_db = get_order_for_customer(db, str(order_id), str(current_customer.id))
+    if not order_db:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+    # Reconstruir la lista de items según tu modelo Pydantic
+    items_pydantic: List[OrderItemInput] = []
+    for item in order_db.items:
+        # product_name guarda el UUID en texto
+        product_uuid = UUID(item.product_name)
+        items_pydantic.append(
+            OrderItemInput(
+                productId=product_uuid,
+                quantity=item.quantity
+            )
+        )
+
+    # Estado desde tracking (o "pendiente" si no hay)
+    status = order_db.tracking.status if order_db.tracking else "pendiente"
+
+    # Devolver en el formato de tu modelo Order
+    return Order(
+        id=UUID(order_db.id),
+        userId=UUID(order_db.user_id),
+        items=items_pydantic,
+        notes=None,  # por ahora no guardamos notes en BD
+        status=status,
+        createdAt=order_db.created_at
+    )
+@app.get(f"{API_PREFIX}/mis-pedidos", response_model=List[Order], tags=["PedidoService"])
+def list_my_orders(
+    current_customer: Customer = Depends(get_current_customer),
+    db: Session = Depends(get_db)
+):
+    """
+    (Diagrama extra) Listar todos los pedidos del cliente autenticado.
+    """
+    # 1) Buscar todos los pedidos del usuario en BD
+    orders_db = db.query(OrderORM).filter(
+        OrderORM.user_id == str(current_customer.id)
+    ).all()
+
+    result: List[Order] = []
+
+    for order_db in orders_db:
+        # Reconstruir items Pydantic
+        items_pydantic: List[OrderItemInput] = []
+        for item in order_db.items:
+            try:
+                product_uuid = UUID(item.product_name)
+            except:
+                product_uuid = UUID("00000000-0000-0000-0000-000000000000")
+
+            items_pydantic.append(
+                OrderItemInput(
+                    productId=product_uuid,
+                    quantity=item.quantity
+                )
+            )
+
+        # Estado desde tracking
+        status = order_db.tracking.status if order_db.tracking else "pendiente"
+
+        # Armar modelo Order
+        result.append(
+            Order(
+                id=UUID(order_db.id),
+                userId=UUID(order_db.user_id),
+                items=items_pydantic,
+                notes=None,
+                status=status,
+                createdAt=order_db.created_at
+            )
+        )
+
+    return result
+
+
 
 
 # -----------------------------

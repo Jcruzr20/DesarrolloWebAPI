@@ -1,14 +1,12 @@
 # models.py
-from sqlalchemy import Column, String, DateTime, DECIMAL, Integer, ForeignKey
+from sqlalchemy import Column, String, DateTime, DECIMAL, Integer, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from uuid import uuid4
 
 from database import Base
 
-# -------------------------
-# CUSTOMER
-# -------------------------
+
 class Customer(Base):
     __tablename__ = "customer"
 
@@ -18,7 +16,14 @@ class Customer(Base):
     phone = Column(String(30))
     hashed_password = Column(String(255), nullable=False)
 
+    # 👇 NUEVO: campo para saber si el correo fue verificado
+    email_verified = Column(Boolean, default=False)
+
+    # Si ya tienes created_at, déjalo; si no, puedes agregarlo:
+    # created_at = Column(DateTime, default=datetime.now)
+
     orders = relationship("Order", back_populates="customer")
+
 
 
 # -------------------------

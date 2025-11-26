@@ -93,6 +93,13 @@ class EmailValidationToken(BaseModel):
     validatedAt: Optional[datetime] = None
 
 # --- Diagrama 03: Cuenta Usuario ---
+class CustomerProfile(BaseModel):
+    id: UUID
+    name: str
+    email: str
+    phone: Optional[str] = None
+    emailVerified: bool
+
 class UserAccountInput(BaseModel):
     status: str # ej. "activo", "inactivo"
 
@@ -402,12 +409,11 @@ class IntegrationJob(BaseModel):
 
 
 # --- 2. CONFIGURACIÓN DE SEGURIDAD ---
-# (Usaremos la misma lógica de Chocomanía)
+# --- 2. CONFIGURACIÓN DE SEGURIDAD ---
 SECRET_KEY = "clave-secreta-pollos-abrosos"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-# El tokenUrl DEBE calzar con el endpoint de login (Diagrama 04)
 oauth2_scheme = HTTPBearer()
 
 
@@ -427,6 +433,9 @@ def crear_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+
+# --- helper BD ---
 def get_customer_by_email(db: Session, email: str) -> Optional[CustomerORM]:
     return db.query(CustomerORM).filter(CustomerORM.email == email).first()
 
@@ -438,6 +447,22 @@ def autenticar_cliente(db: Session, email: str, password: str) -> Optional[Custo
     if not verificar_contraseña(password, user.hashed_password):
         return None
     return user
+
+
+# --- Token especial para verificación de correo --- 
+def crear_token_verificacion_email(email: str) -> str:
+    """
+    Crea un JWT de corta duración para verificar correo.
+    """
+    datos = {
+        "sub": email,          # sujeto = correo
+        "scope": "email_verify"
+    }
+    return crear_access_token(
+        datos,
+        expires_delta=timedelta(minutes=30)
+    )
+
 
 
 # --- 4. "BASE DE DATOS" (temporal, en memoria) ---
@@ -589,6 +614,34 @@ def login_for_access_token(
     access_token = crear_access_token(data={"sub": user.email})
 
     return Token(access_token=access_token)
+# --- Verificación de correo ---
+@app.get(f"{API_PREFIX}/auth/verify-email", tags=["Auth"])
+def verify_email(token: str, db: Session = Depends(get_db)):
+    """
+    Endpoint que se llama desde el link enviado por correo.
+    Marca el correo del usuario como verificado.
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        scope = payload.get("scope")
+        email = payload.get("sub")
+
+        if scope != "email_verify" or email is None:
+            raise HTTPException(status_code=400, detail="Token de verificación inválido")
+
+    except JWTError:
+        raise HTTPException(status_code=400, detail="Token inválido o expirado")
+
+    user = get_customer_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    # Marcar como verificado
+    user.email_verified = True
+    db.commit()
+
+    return {"message": "Correo verificado correctamente"}
+
 
 
 
@@ -680,42 +733,48 @@ def validate_email(input: EmailValidationInput):
 
 # --- Servicio: User (Diagramas 01, 03, 06, 21, 22) ---
 
+# --- Registro de clientes con link de verificación de correo ---
 @app.post(f"{API_PREFIX}/clientes/registro", response_model=Customer, status_code=201, tags=["UserService"])
 def register_customer(input: CustomerRegistrationInput, db: Session = Depends(get_db)):
     """
     (Diagrama 01) Registro de Clientes.
-    Crea un cliente nuevo y genera un código de verificación de correo.
-    Ahora guardando en MySQL.
+    Crea el cliente en MySQL y genera un LINK de verificación de correo (JWT).
+    El link se imprime en consola como simulación del correo.
     """
-    # Validar email duplicado en BD
+
+    # 1) Validar email duplicado
     existing = get_customer_by_email(db, input.email)
     if existing:
         raise HTTPException(status_code=400, detail="El email ya está en uso")
 
     print(f"Registrando nuevo cliente: {input.name}")
 
-    # Hashear la contraseña
+    # 2) Hashear contraseña
     hashed_password = hashear_contraseña(input.password)
 
-    # Crear el cliente en la BD
+    # 3) Crear el cliente en BD
     new_customer = CustomerORM(
         name=input.name,
         email=input.email,
         phone=input.phone,
-        hashed_password=hashed_password
+        hashed_password=hashed_password,
+        email_verified=False
     )
 
     db.add(new_customer)
     db.commit()
     db.refresh(new_customer)
 
-    # Generar código de verificación (simulado)
-    code = f"{random.randint(100000, 999999)}"
-    email_verification_tokens[str(new_customer.id)] = code
 
-    print(f"[DEBUG] Código de verificación para {new_customer.email}: {code}")
+    # 4) Generar token JWT corto para verificación de email
+    token_verificacion = crear_token_verificacion_email(new_customer.email)
+    verify_url = f"http://127.0.0.1:8000{API_PREFIX}/auth/verify-email?token={token_verificacion}"
 
-    # Devolver Customer Pydantic
+    # 5) MOSTRAR LINK EN CONSOLA (simula el correo)
+    print(f"[DEBUG] Link para verificar correo de {new_customer.email}:")
+    print(f"👉 {verify_url}")
+
+    # 6) Devolver al cliente (igual que hacías antes)
     return Customer(
         id=new_customer.id,
         name=new_customer.name,
@@ -724,6 +783,17 @@ def register_customer(input: CustomerRegistrationInput, db: Session = Depends(ge
         hashed_password=new_customer.hashed_password,
         emailVerified=False
     )
+# --- Perfil del cliente logueado ---
+@app.get(f"{API_PREFIX}/clientes/me", response_model=CustomerProfile, tags=["UserService"])
+def get_my_profile(current_customer: CustomerORM = Depends(get_current_customer)):
+    return CustomerProfile(
+        id=current_customer.id,
+        name=current_customer.name,
+        email=current_customer.email,
+        phone=current_customer.phone,
+        emailVerified=bool(current_customer.email_verified),
+    )
+
 
 
 

@@ -550,6 +550,7 @@ async def get_current_customer(
 
 
 
+
 # Prefijo global para todos los endpoints
 API_PREFIX = "/api/pollosabroso"
 
@@ -611,9 +612,11 @@ def login_for_access_token(
         raise HTTPException(status_code=401, detail="Correo o contraseña incorrectos")
 
     # OJO: aquí usamos tu propia función crear_access_token
-    access_token = crear_access_token(data={"sub": user.email})
+    access_token = crear_access_token(data={"sub": user.id})
+
 
     return Token(access_token=access_token)
+
 # --- Verificación de correo ---
 @app.get(f"{API_PREFIX}/auth/verify-email", tags=["Auth"])
 def verify_email(token: str, db: Session = Depends(get_db)):

@@ -7,17 +7,19 @@ from typing import Optional, List
 from uuid import UUID, uuid4
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-import io 
+import io
 import random
 from sqlalchemy.orm import Session
-from fastapi import Depends
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 from database import SessionLocal, engine
 from models import Base, Customer as CustomerORM, Order as OrderORM, OrderItem as OrderItemORM, Tracking as TrackingORM, DeliveryPerson as DeliveryPersonORM
-# Crear tablas si no existen (seguro aunque ya estén creadas)
+
+# Crear tablas si no existen
 Base.metadata.create_all(bind=engine)
 
-# Dependencia para obtener la sesión de BD
+# Dependencia BD
 def get_db():
     db = SessionLocal()
     try:
@@ -25,6 +27,27 @@ def get_db():
     finally:
         db.close()
 
+# ---------------------------
+# CORS + App Config
+# ---------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+APP_TITLE = "API Pollos Abrosos"
+API_PREFIX = "/api/pollosabroso"
+
+app = FastAPI(
+    title=APP_TITLE,
+    description="Implementación Monolítica de la arquitectura de servicios.",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # permitir cualquier origen (solo para practicar)
+    allow_credentials=False,  # IMPORTANTE: en False para que '*' funcione
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 
@@ -91,7 +114,7 @@ class Session(BaseModel):
     token: str
     createdAt: datetime = Field(default_factory=datetime.now)
     expiresAt: datetime
-
+#############################################################################
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -404,6 +427,17 @@ def crear_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+def get_customer_by_email(db: Session, email: str) -> Optional[CustomerORM]:
+    return db.query(CustomerORM).filter(CustomerORM.email == email).first()
+
+
+def autenticar_cliente(db: Session, email: str, password: str) -> Optional[CustomerORM]:
+    user = get_customer_by_email(db, email)
+    if not user:
+        return None
+    if not verificar_contraseña(password, user.hashed_password):
+        return None
+    return user
 
 
 # --- 4. "BASE DE DATOS" (temporal, en memoria) ---
@@ -491,14 +525,6 @@ async def get_current_customer(
 
 
 
-
-# --- 6. CREA LA APP ---
-app = FastAPI(
-    title="API Pollos Abrosos",
-    description="Implementación Monolítica de la arquitectura de servicios.",
-    version="1.0.0"
-)
-
 # Prefijo global para todos los endpoints
 API_PREFIX = "/api/pollosabroso"
 
@@ -539,6 +565,31 @@ def login(
     )
 
     return {"access_token": access_token, "token_type": "bearer"}
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+@app.post(f"{API_PREFIX}/auth/login", response_model=Token, tags=["Auth"])
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Login de cliente.
+    Recibe username (email) y password vía formulario x-www-form-urlencoded.
+    Devuelve un access_token JWT.
+    """
+    user = autenticar_cliente(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Correo o contraseña incorrectos")
+
+    # OJO: aquí usamos tu propia función crear_access_token
+    access_token = crear_access_token(data={"sub": user.email})
+
+    return Token(access_token=access_token)
+
 
 
 @app.post(f"{API_PREFIX}/sesion/recuperar", tags=["AuthService"])

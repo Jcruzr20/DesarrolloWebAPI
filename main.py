@@ -21,7 +21,7 @@ from database import SessionLocal, engine
 from models import Base, Customer as CustomerORM, Order as OrderORM, OrderItem as OrderItemORM, Tracking as TrackingORM, DeliveryPerson as DeliveryPersonORM
 from models import Customer, Order, OrderItem, Tracking, DeliveryPerson, ProductORM
 from decimal import Decimal
-
+from database import get_db
 
 # Crear tablas si no existen
 Base.metadata.create_all(bind=engine)
@@ -175,9 +175,29 @@ class OrderSummary(BaseModel):
     description: str
     itemsCount: int
     pointsEarned: int
+    total: float  # NUEVO
 
     class Config:
-        from_attributes = True
+        orm_mode = True
+# --- Página "Mis pedidos" ---
+class MyOrderItem(BaseModel):
+    productName: str
+    quantity: int
+    price: float
+
+
+class MyOrderSummary(BaseModel):
+    id: str
+    date: datetime
+    description: str
+    total: float
+    status: str
+    items: List[MyOrderItem]
+
+    class Config:
+        orm_mode = True
+
+
 
 class OrderPersonalizationInput(BaseModel):
     # userId se obtendrá del token
@@ -315,6 +335,23 @@ class Notification(BaseModel):
     sentAt: datetime = Field(default_factory=datetime.now)
 
 # --- Diagrama 17: Asignacion Automatica de Repartidores ---
+# --- Tracking con repartidor ---
+
+class DriverInfo(BaseModel):
+    id: str
+    name: str
+    phone: Optional[str] = None
+
+
+class TrackingResponse(BaseModel):
+    orderId: str
+    status: str
+    updatedAt: datetime
+    driver: Optional[DriverInfo] = None
+
+    class Config:
+        from_attributes = True   # (equivalente a orm_mode = True)
+
 class AutoDriverAssignmentInput(BaseModel):
     orderId: UUID
 
@@ -363,6 +400,16 @@ class Tracking(BaseModel):
 
 
 # --- Diagrama 21: Acumular Puntos por Compras ---
+class PurchaseHistoryItem(BaseModel):
+    id: str
+    date: datetime
+    description: str
+    itemsCount: int
+    pointsEarned: int
+    total: Decimal  # 👈 NUEVO campo
+
+    class Config:
+        orm_mode = True
 class PointsUpdate(BaseModel):
     amount: int
 
@@ -941,6 +988,7 @@ def get_my_orders(
                 description=description,
                 itemsCount=total_unidades,
                 pointsEarned=earned_points,
+                total=float(order.total or 0)  # AQUÍ MANDAMOS EL TOTAL REAL
             )
         )
 
@@ -1126,53 +1174,64 @@ def get_order_by_id(
         status=status,
         createdAt=order_db.created_at
     )
-@app.get(f"{API_PREFIX}/mis-pedidos", response_model=List[Order], tags=["PedidoService"])
-def list_my_orders(
-    current_customer: Customer = Depends(get_current_customer),
-    db: Session = Depends(get_db)
+@app.get(f"{API_PREFIX}/clientes/me/mis-pedidos", response_model=List[MyOrderSummary], tags=["PedidoService"])
+def get_my_orders_with_status(
+    current_customer: CustomerORM = Depends(get_current_customer),
+    db: Session = Depends(get_db),
 ):
     """
-    (Diagrama extra) Listar todos los pedidos del cliente autenticado.
+    Devuelve el listado de pedidos del cliente actual
+    incluyendo estado y detalle de ítems.
     """
-    # 1) Buscar todos los pedidos del usuario en BD
-    orders_db = db.query(OrderORM).filter(
-        OrderORM.user_id == str(current_customer.id)
-    ).all()
+    orders = (
+        db.query(OrderORM)
+        .filter(OrderORM.user_id == current_customer.id)
+        .order_by(OrderORM.created_at.desc())
+        .all()
+    )
 
-    result: List[Order] = []
+    result: List[MyOrderSummary] = []
 
-    for order_db in orders_db:
-        # Reconstruir items Pydantic
-        items_pydantic: List[OrderItemInput] = []
-        for item in order_db.items:
-            try:
-                product_uuid = UUID(item.product_name)
-            except:
-                product_uuid = UUID("00000000-0000-0000-0000-000000000000")
+    for order in orders:
+        # Relación con Tracking (uselist=False)
+        status = "Desconocido"
+        if order.tracking:
+            status = order.tracking.status or "Sin estado"
 
-            items_pydantic.append(
-                OrderItemInput(
-                    productId=product_uuid,
-                    quantity=item.quantity
+        # Ítems del pedido
+        items_data: List[MyOrderItem] = []
+        for item in order.items:
+            items_data.append(
+                MyOrderItem(
+                    productName=item.product_name,
+                    quantity=item.quantity,
+                    price=float(item.price or 0),
                 )
             )
 
-        # Estado desde tracking
-        status = order_db.tracking.status if order_db.tracking else "pendiente"
+        # Descripción
+        if order.items:
+            first_name = order.items[0].product_name
+            if len(order.items) == 1:
+                description = first_name
+            else:
+                description = f"{first_name} + {len(order.items) - 1} ítem(s) más"
+        else:
+            description = "Pedido sin ítems"
 
-        # Armar modelo Order
         result.append(
-            Order(
-                id=UUID(order_db.id),
-                userId=UUID(order_db.user_id),
-                items=items_pydantic,
-                notes=None,
+            MyOrderSummary(
+                id=str(order.id),
+                date=order.created_at,
+                description=description,
+                total=float(order.total or 0),
                 status=status,
-                createdAt=order_db.created_at
+                items=items_data,
             )
         )
 
     return result
+
 
 
 
@@ -1351,35 +1410,47 @@ def update_tracking(
 
 API_PREFIX = "/api/pollosabroso"  # declarada solo una vez en todo el archivo
 
-@app.get(f"{API_PREFIX}/tracking/{{orderId}}", response_model=Tracking, tags=["Tracking"])
-def get_tracking(orderId: UUID, db: Session = Depends(get_db)):
+@app.get(f"{API_PREFIX}/tracking/{{order_id}}",
+         response_model=TrackingResponse,
+         tags=["TrackingService"])
+def get_tracking(
+    order_id: str,
+    db: Session = Depends(get_db)
+):
     """
-    (Diagrama 16) Consultar Tracking de Pedido.
-    Lee el tracking desde la base de datos (tabla tracking).
+    Devuelve el estado actual del tracking de un pedido,
+    incluyendo (si existe) los datos del repartidor asignado.
     """
-
-    # Como order_id es String(36), comparamos con str(orderId)
-    tracking_orm = (
+    # Tomamos el último tracking para ese pedido
+    tracking = (
         db.query(TrackingORM)
-        .filter(TrackingORM.order_id == str(orderId))
+        .filter(TrackingORM.order_id == order_id)
         .order_by(TrackingORM.updated_at.desc())
         .first()
     )
 
-    if not tracking_orm:
-        raise HTTPException(status_code=404, detail="Tracking no encontrado")
+    if not tracking:
+        raise HTTPException(
+            status_code=404,
+            detail="No hay información de tracking para este pedido."
+        )
 
-    # ORM -> Pydantic
-    tracking = Tracking(
-        id=tracking_orm.id,              # Pydantic lo convierte a UUID
-        orderId=tracking_orm.order_id,   # idem
-        status=tracking_orm.status,
-        lat=None,                        # no existen en la BD, por eso los dejamos en None
-        lng=None,
-        updatedAt=tracking_orm.updated_at,
+    # Armar info del repartidor (puede ser None)
+    driver_info = None
+    if tracking.driver:  # gracias al relationship en models.py
+        driver_info = DriverInfo(
+            id=str(tracking.driver.id),
+            name=tracking.driver.name,
+            phone=tracking.driver.phone
+        )
+
+    # Respuesta final
+    return TrackingResponse(
+        orderId=str(tracking.order_id),
+        status=tracking.status,
+        updatedAt=tracking.updated_at,
+        driver=driver_info
     )
-
-    return tracking
 
 
 

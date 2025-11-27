@@ -19,6 +19,9 @@ from datetime import datetime
 from pydantic import BaseModel
 from database import SessionLocal, engine
 from models import Base, Customer as CustomerORM, Order as OrderORM, OrderItem as OrderItemORM, Tracking as TrackingORM, DeliveryPerson as DeliveryPersonORM
+from models import Customer, Order, OrderItem, Tracking, DeliveryPerson, ProductORM
+from decimal import Decimal
+
 
 # Crear tablas si no existen
 Base.metadata.create_all(bind=engine)
@@ -213,6 +216,11 @@ class Order(BaseModel):
     notes: Optional[str] = None
     status: str = "pendiente"
     createdAt: datetime = Field(default_factory=datetime.now)
+class OrderHistoryItem(BaseModel):
+    id: UUID
+    date: datetime
+    description: str
+    pointsEarned: int
 
 # Lista para almacenar pedidos (simulado)
 orders: List[Order] = []
@@ -889,7 +897,7 @@ def canjear_puntos(
         "points": current_customer.points
     }
 
-@app.get(f"{API_PREFIX}/clientes/me/pedidos", response_model=List[OrderSummary], tags=["PedidoService"])
+@app.get(f"{API_PREFIX}/clientes/me/pedidos", response_model=List[OrderSummary], tags=["PedidoService"]) 
 def get_my_orders(
     current_customer: CustomerORM = Depends(get_current_customer),
     db: Session = Depends(get_db)
@@ -939,6 +947,7 @@ def get_my_orders(
     return summaries
 
 
+
 @app.post(f"{API_PREFIX}/cupones/canjear", response_model=Response, tags=["UserService"])
 def redeem_coupon(input: RedeemCouponInput, current_customer: Customer = Depends(get_current_customer)):
     """
@@ -976,37 +985,76 @@ orders: List[Order] = []
 @app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
 def register_order(
     order_input: OrderInput,
-    current_customer: CustomerORM = Depends(get_current_customer),  # 👈 mejor usar el ORM
+    current_customer: Customer = Depends(get_current_customer),  # usamos el ORM
     db: Session = Depends(get_db)
 ):
     """
     (Diagrama 09) Registro de Pedidos.
-    Versión MySQL adaptada a los modelos Pydantic + PUNTOS.
+    Versión MySQL con productos reales (tabla products) + puntos.
     """
     print(f"Registrando nuevo pedido para {current_customer.email}")
 
-    # 1) Crear pedido en BD (total lo dejamos en 0 por ahora)
+    # 1) Validar que vengan ítems
+    if not order_input.items:
+        raise HTTPException(status_code=400, detail="El pedido debe tener al menos un ítem")
+
+    # 2) Tomar todos los IDs de productos del request
+    product_ids = [str(item.productId) for item in order_input.items]
+
+    # 3) Buscar los productos reales en la BBDD
+    products = (
+        db.query(ProductORM)
+        .filter(ProductORM.id.in_(product_ids))
+        .all()
+    )
+
+    # Si falta alguno, error
+    if len(products) != len(set(product_ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="Uno o más productos no existen en el sistema",
+        )
+
+    # 4) Mapear id -> producto
+    product_by_id = {p.id: p for p in products}
+
+    # 5) Calcular total del pedido y total de unidades
+    total_precio = Decimal("0.00")
+    total_unidades = 0
+
+    for item in order_input.items:
+        pid = str(item.productId)
+        producto = product_by_id[pid]
+        precio = Decimal(producto.price)
+
+        total_precio += precio * item.quantity
+        total_unidades += item.quantity
+
+    # 6) Crear pedido en BD con total real
     new_order = OrderORM(
         user_id=current_customer.id,
-        total=0  # porque tu modelo aún no incluye precio real
+        total=total_precio
     )
     db.add(new_order)
     db.commit()
     db.refresh(new_order)
 
-    # 2) Registrar items en la BD
+    # 7) Registrar ítems en la BD usando nombre y precio reales
     for item in order_input.items:
+        pid = str(item.productId)
+        producto = product_by_id[pid]
+
         db_item = OrderItemORM(
             order_id=new_order.id,
-            product_name=str(item.productId),  # guardamos productId como texto
+            product_name=producto.name,   # nombre real del producto
             quantity=item.quantity,
-            price=0  # sin precio por ahora
+            price=producto.price          # precio real desde products
         )
         db.add(db_item)
 
     db.commit()
 
-    # 3) Crear tracking inicial
+    # 8) Crear tracking inicial
     tracking = TrackingORM(
         order_id=new_order.id,
         status="En preparación"
@@ -1015,25 +1063,28 @@ def register_order(
     db.commit()
     db.refresh(tracking)
 
-    # 4) 🔥 Calcular puntos ganados y sumarlos al cliente
-    #    Regla simple: 10 puntos por cada unidad comprada
-    total_unidades = sum(item.quantity for item in order_input.items)
-    earned_points = total_unidades * 10
+    # 9) Calcular puntos ganados y sumarlos al cliente
+    earned_points = total_unidades * 10  # regla: 10 puntos por unidad
 
     current_customer.points += earned_points
     db.commit()
     db.refresh(current_customer)
 
-    print(f"[PUNTOS] Pedido {new_order.id}: +{earned_points} puntos para {current_customer.email}. Total ahora: {current_customer.points}")
+    print(
+        f"[PUNTOS] Pedido {new_order.id}: +{earned_points} puntos para "
+        f"{current_customer.email}. Total ahora: {current_customer.points}"
+    )
 
-    # 5) Devolver el pedido según tu Pydantic Order
+    # 10) Devolver el pedido según tu Pydantic Order
+    # (si tu esquema Order NO tiene 'total', puedes quitar ese campo)
     return Order(
         id=new_order.id,
         userId=new_order.user_id,
         items=order_input.items,
         notes=order_input.notes,
         status=tracking.status,
-        createdAt=new_order.created_at
+        createdAt=new_order.created_at,
+        total=total_precio  # quítalo si tu modelo Order no lo tiene
     )
 
 @app.get(f"{API_PREFIX}/pedidos/{{order_id}}", response_model=Order, tags=["PedidoService"])

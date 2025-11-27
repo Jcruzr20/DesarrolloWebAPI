@@ -4,7 +4,7 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 from uuid import uuid4
 from sqlalchemy import Integer
-
+from sqlalchemy.dialects.mysql import CHAR
 from database import Base
 
 class Customer(Base):
@@ -90,3 +90,11 @@ class DeliveryPerson(Base):
 
     # NUEVO: relación inversa
     deliveries = relationship("Tracking", back_populates="driver")
+#####
+class ProductORM(Base):
+    __tablename__ = "products"
+
+    id = Column(CHAR(36), primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    price = Column(DECIMAL(10, 2), nullable=False)
+    description = Column(String(255), nullable=True)

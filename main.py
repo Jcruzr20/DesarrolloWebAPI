@@ -12,7 +12,11 @@ import random
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-
+from typing import List
+from fastapi import Depends
+from sqlalchemy.orm import Session
+from datetime import datetime
+from pydantic import BaseModel
 from database import SessionLocal, engine
 from models import Base, Customer as CustomerORM, Order as OrderORM, OrderItem as OrderItemORM, Tracking as TrackingORM, DeliveryPerson as DeliveryPersonORM
 
@@ -71,14 +75,19 @@ class CustomerRegistrationInput(BaseModel):
     phone: str
     password: str
 
-class Customer(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
+class Customer(BaseModel): 
+    id: UUID
     name: str
     email: str
     phone: str
-    hashed_password: str  # ¡Importante! Nunca guardamos la clave en texto plano
-    emailVerified: bool = False          # ⬅ NUEVO CAMPO
-    createdAt: datetime = Field(default_factory=datetime.now)
+    emailVerified: bool = False
+    createdAt: datetime
+
+    class Config:
+        from_attributes = True
+
+
+
 
 # --- Diagrama 02: Validacion Correo ---
 class EmailValidationInput(BaseModel):
@@ -99,6 +108,11 @@ class CustomerProfile(BaseModel):
     email: str
     phone: Optional[str] = None
     emailVerified: bool
+    points: int = 0         # 👈 NUEVO CAMPO
+
+    class Config:
+        from_attributes = True    # o orm_mode = True
+
 
 class UserAccountInput(BaseModel):
     status: str # ej. "activo", "inactivo"
@@ -121,7 +135,7 @@ class Session(BaseModel):
     token: str
     createdAt: datetime = Field(default_factory=datetime.now)
     expiresAt: datetime
-#############################################################################
+############################
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -152,6 +166,16 @@ class UserProfile(BaseModel):
     updatedAt: datetime = Field(default_factory=datetime.now)
 
 # --- Diagrama 07: Personalizacion de Pedidos ---
+class OrderSummary(BaseModel):
+    id: str
+    date: datetime
+    description: str
+    itemsCount: int
+    pointsEarned: int
+
+    class Config:
+        from_attributes = True
+
 class OrderPersonalizationInput(BaseModel):
     # userId se obtendrá del token
     spiceLevel: str
@@ -331,6 +355,9 @@ class Tracking(BaseModel):
 
 
 # --- Diagrama 21: Acumular Puntos por Compras ---
+class PointsUpdate(BaseModel):
+    amount: int
+
 class LoyaltyPointsInput(BaseModel):
     userId: UUID
     orderId: UUID
@@ -795,6 +822,7 @@ def get_my_profile(current_customer: CustomerORM = Depends(get_current_customer)
         email=current_customer.email,
         phone=current_customer.phone,
         emailVerified=bool(current_customer.email_verified),
+        points=current_customer.points,   # 👈 AQUÍ SUMAMOS LOS PUNTOS
     )
 
 
@@ -823,20 +851,93 @@ def manage_profile(input: UserProfileInput, current_customer: Customer = Depends
     # (En una BBDD real, aquí harías db.commit())
     return Response(message=f"Perfil actualizado para {current_customer.name}")
 
-@app.post(f"{API_PREFIX}/puntos/acumular", response_model=Response, tags=["UserService"])
-def accrue_points(input: LoyaltyPointsInput, current_customer: Customer = Depends(get_current_customer)):
+@app.post(f"{API_PREFIX}/clientes/me/puntos/acumular", tags=["UserService"])
+def acumular_puntos(
+    input: PointsUpdate,
+    current_customer: CustomerORM = Depends(get_current_customer),
+    db: Session = Depends(get_db)
+):
+    if input.amount <= 0:
+        raise HTTPException(status_code=400, detail="La cantidad debe ser positiva.")
+
+    current_customer.points += input.amount
+    db.commit()
+    db.refresh(current_customer)
+
+    return {
+        "message": f"Se sumaron {input.amount} puntos.",
+        "points": current_customer.points
+    }
+@app.post(f"{API_PREFIX}/clientes/me/puntos/canjear", tags=["UserService"])
+def canjear_puntos(
+    input: PointsUpdate,
+    current_customer: CustomerORM = Depends(get_current_customer),
+    db: Session = Depends(get_db)
+):
+    if input.amount <= 0:
+        raise HTTPException(status_code=400, detail="La cantidad debe ser positiva.")
+
+    if current_customer.points < input.amount:
+        raise HTTPException(status_code=400, detail="No tienes puntos suficientes para canjear.")
+
+    current_customer.points -= input.amount
+    db.commit()
+    db.refresh(current_customer)
+
+    return {
+        "message": f"Se canjearon {input.amount} puntos.",
+        "points": current_customer.points
+    }
+
+@app.get(f"{API_PREFIX}/clientes/me/pedidos", response_model=List[OrderSummary], tags=["PedidoService"])
+def get_my_orders(
+    current_customer: CustomerORM = Depends(get_current_customer),
+    db: Session = Depends(get_db)
+):
     """
-    (Diagrama 21) Acumular Puntos.
-    Endpoint protegido.
+    Devuelve los pedidos recientes del cliente actual.
+    Se usa para la tabla 'Compras recientes'.
     """
-    print(f"Añadiendo {input.points} puntos al usuario {current_customer.email} por orden {input.orderId}")
-    # Lógica de BBDD (Simulada)
-    db_loyalty_points.append(LoyaltyPoints(
-        userId=current_customer.id,
-        orderId=input.orderId,
-        points=input.points
-    ))
-    return Response(message=f"Puntos añadidos")
+    # 1) Obtener los pedidos del cliente (los 10 más recientes)
+    orders = (
+        db.query(OrderORM)
+        .filter(OrderORM.user_id == current_customer.id)
+        .order_by(OrderORM.created_at.desc())
+        .limit(10)
+        .all()
+    )
+
+    summaries: List[OrderSummary] = []
+
+    for order in orders:
+        # Buscar los items del pedido
+        items = db.query(OrderItemORM).filter(OrderItemORM.order_id == order.id).all()
+
+        total_unidades = sum(i.quantity for i in items)
+        earned_points = total_unidades * 10  # misma regla que usamos en register_order
+
+        # Podríamos armar una descripción simple
+        if items:
+            first_name = items[0].product_name
+            if len(items) == 1:
+                description = first_name
+            else:
+                description = f"{first_name} + {len(items)-1} ítem(s) más"
+        else:
+            description = "Pedido sin items"
+
+        summaries.append(
+            OrderSummary(
+                id=str(order.id),
+                date=order.created_at,
+                description=description,
+                itemsCount=total_unidades,
+                pointsEarned=earned_points,
+            )
+        )
+
+    return summaries
+
 
 @app.post(f"{API_PREFIX}/cupones/canjear", response_model=Response, tags=["UserService"])
 def redeem_coupon(input: RedeemCouponInput, current_customer: Customer = Depends(get_current_customer)):
@@ -875,19 +976,19 @@ orders: List[Order] = []
 @app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
 def register_order(
     order_input: OrderInput,
-    current_customer: Customer = Depends(get_current_customer),
+    current_customer: CustomerORM = Depends(get_current_customer),  # 👈 mejor usar el ORM
     db: Session = Depends(get_db)
 ):
     """
     (Diagrama 09) Registro de Pedidos.
-    Versión MySQL adaptada a los modelos Pydantic.
+    Versión MySQL adaptada a los modelos Pydantic + PUNTOS.
     """
     print(f"Registrando nuevo pedido para {current_customer.email}")
 
-    # 1) Crear pedido en BD (total lo dejaremos como 0)
+    # 1) Crear pedido en BD (total lo dejamos en 0 por ahora)
     new_order = OrderORM(
         user_id=current_customer.id,
-        total=0  # porque tu modelo no incluye precio todavía
+        total=0  # porque tu modelo aún no incluye precio real
     )
     db.add(new_order)
     db.commit()
@@ -899,7 +1000,7 @@ def register_order(
             order_id=new_order.id,
             product_name=str(item.productId),  # guardamos productId como texto
             quantity=item.quantity,
-            price=0  # porque tu modelo no trae precio
+            price=0  # sin precio por ahora
         )
         db.add(db_item)
 
@@ -914,7 +1015,18 @@ def register_order(
     db.commit()
     db.refresh(tracking)
 
-    # 4) Devolver el pedido según tu Pydantic Order
+    # 4) 🔥 Calcular puntos ganados y sumarlos al cliente
+    #    Regla simple: 10 puntos por cada unidad comprada
+    total_unidades = sum(item.quantity for item in order_input.items)
+    earned_points = total_unidades * 10
+
+    current_customer.points += earned_points
+    db.commit()
+    db.refresh(current_customer)
+
+    print(f"[PUNTOS] Pedido {new_order.id}: +{earned_points} puntos para {current_customer.email}. Total ahora: {current_customer.points}")
+
+    # 5) Devolver el pedido según tu Pydantic Order
     return Order(
         id=new_order.id,
         userId=new_order.user_id,

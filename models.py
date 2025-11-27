@@ -3,9 +3,9 @@ from sqlalchemy import Column, String, DateTime, DECIMAL, Integer, ForeignKey, B
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from uuid import uuid4
+from sqlalchemy import Integer
 
 from database import Base
-
 
 class Customer(Base):
     __tablename__ = "customer"
@@ -16,12 +16,13 @@ class Customer(Base):
     phone = Column(String(30))
     hashed_password = Column(String(255), nullable=False)
 
-    # 👇 NUEVO: campo para saber si el correo fue verificado
+    # 👇 Ya estaba
     email_verified = Column(Boolean, default=False)
 
-    # Si ya tienes created_at, déjalo; si no, puedes agregarlo:
-    # created_at = Column(DateTime, default=datetime.now)
+    # 👇 NUEVO: campo de puntos reales
+    points = Column(Integer, nullable=False, default=0)   # 👈 ESTE ES EL IMPORTANTE
 
+    # Relación con pedidos
     orders = relationship("Order", back_populates="customer")
 
 

@@ -1,12 +1,16 @@
 # models.py
 from sqlalchemy import Column, String, DateTime, DECIMAL, Integer, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.mysql import CHAR
 from datetime import datetime
 from uuid import uuid4
-from sqlalchemy import Integer
-from sqlalchemy.dialects.mysql import CHAR
+
 from database import Base
 
+
+# -------------------------
+# CUSTOMER
+# -------------------------
 class Customer(Base):
     __tablename__ = "customer"
 
@@ -16,15 +20,14 @@ class Customer(Base):
     phone = Column(String(30))
     hashed_password = Column(String(255), nullable=False)
 
-    # 👇 Ya estaba
+    # Campo de verificación de correo
     email_verified = Column(Boolean, default=False)
 
-    # 👇 NUEVO: campo de puntos reales
-    points = Column(Integer, nullable=False, default=0)   # 👈 ESTE ES EL IMPORTANTE
+    # Campo de puntos reales del cliente
+    points = Column(Integer, nullable=False, default=0)
 
     # Relación con pedidos
     orders = relationship("Order", back_populates="customer")
-
 
 
 # -------------------------
@@ -35,12 +38,17 @@ class Order(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
     user_id = Column(String(36), ForeignKey("customer.id"))
-    total = Column(DECIMAL(10,2))
+    total = Column(DECIMAL(10, 2))
     created_at = Column(DateTime, default=datetime.now)
 
+    # NUEVO: estado del pedido
+    status = Column(String(50), nullable=False, default="En preparación")
+
+    # Relaciones
     customer = relationship("Customer", back_populates="orders")
     items = relationship("OrderItem", back_populates="order")
     tracking = relationship("Tracking", back_populates="order", uselist=False)
+
 
 
 # -------------------------
@@ -53,8 +61,9 @@ class OrderItem(Base):
     order_id = Column(String(36), ForeignKey("orders.id"))
     product_name = Column(String(100))
     quantity = Column(Integer)
-    price = Column(DECIMAL(10,2))
+    price = Column(DECIMAL(10, 2))
 
+    # Relación con pedido
     order = relationship("Order", back_populates="items")
 
 
@@ -69,13 +78,12 @@ class Tracking(Base):
     status = Column(String(50))
     updated_at = Column(DateTime, default=datetime.now)
 
-    # NUEVO: coincide con tu columna en MySQL
+    # Coincide con tu columna en MySQL
     driver_id = Column(String(36), ForeignKey("delivery_person.id"), nullable=True)
 
     # Relaciones
     order = relationship("Order", back_populates="tracking")
     driver = relationship("DeliveryPerson", back_populates="deliveries")
-
 
 
 # -------------------------
@@ -88,9 +96,13 @@ class DeliveryPerson(Base):
     name = Column(String(100))
     phone = Column(String(30))
 
-    # NUEVO: relación inversa
+    # Relación inversa: trackings que tiene asignados
     deliveries = relationship("Tracking", back_populates="driver")
-#####
+
+
+# -------------------------
+# PRODUCTOS
+# -------------------------
 class ProductORM(Base):
     __tablename__ = "products"
 

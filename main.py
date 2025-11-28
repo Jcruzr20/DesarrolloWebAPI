@@ -1,7 +1,12 @@
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.security import HTTPBearer
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.security import (
+    OAuth2PasswordBearer,
+    OAuth2PasswordRequestForm,
+    HTTPBearer,
+    HTTPAuthorizationCredentials,
+)
+from fastapi.middleware.cors import CORSMiddleware
+
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from uuid import UUID, uuid4
@@ -9,36 +14,27 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import io
 import random
+
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from typing import List
-from fastapi import Depends
-from sqlalchemy.orm import Session
-from datetime import datetime
-from pydantic import BaseModel
-from database import SessionLocal, engine
-from models import Base, Customer as CustomerORM, Order as OrderORM, OrderItem as OrderItemORM, Tracking as TrackingORM, DeliveryPerson as DeliveryPersonORM
-from models import Customer, Order, OrderItem, Tracking, DeliveryPerson, ProductORM
-from decimal import Decimal
-from database import get_db
+
+from database import SessionLocal, engine, Base, get_db
+from models import (
+    Customer as CustomerORM,
+    Order as OrderORM,
+    OrderItem as OrderItemORM,
+    Tracking as TrackingORM,
+    DeliveryPerson as DeliveryPersonORM,
+    ProductORM,
+)
 
 # Crear tablas si no existen
 Base.metadata.create_all(bind=engine)
 
-# Dependencia BD
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 # ---------------------------
 # CORS + App Config
 # ---------------------------
-from fastapi.middleware.cors import CORSMiddleware
-
 APP_TITLE = "API Pollos Abrosos"
 API_PREFIX = "/api/pollosabroso"
 
@@ -56,12 +52,91 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------
+# Asignación automática de repartidor
+# ---------------------------
+
+ESTADOS_ACTIVOS = ["En preparación", "Listo para retiro", "En reparto"]
 
 
+def asignar_repartidor_automatico(db: Session, order: OrderORM) -> DeliveryPersonORM:
+    """
+    Asigna automáticamente un repartidor usando la tabla TRACKING.
+    - Si el pedido ya tiene repartidor, lo reutiliza.
+    - Si no, busca el repartidor con menor carga de pedidos activos.
+    """
 
-# --- LIBRERÍAS DE SEGURIDAD ---
-from passlib.context import CryptContext
-from jose import JWTError, jwt
+    # 1) Buscar el tracking más reciente para este pedido
+    tracking = (
+        db.query(TrackingORM)
+        .filter(TrackingORM.order_id == order.id)
+        .order_by(TrackingORM.updated_at.desc())
+        .first()
+    )
+
+    # Si ya tiene repartidor asignado, devolverlo
+    if tracking and tracking.driver_id:
+        driver = (
+            db.query(DeliveryPersonORM)
+            .filter(DeliveryPersonORM.id == tracking.driver_id)
+            .first()
+        )
+        if driver:
+            return driver
+
+    # 2) Obtener todos los repartidores registrados
+    repartidores = db.query(DeliveryPersonORM).all()
+
+    if not repartidores:
+        raise HTTPException(
+            status_code=400,
+            detail="No hay repartidores registrados para asignar."
+        )
+
+    # 3) Calcular la 'carga' de cada repartidor (cantidad de trackings activos)
+    mejor_repartidor = None
+    menor_carga = None
+
+    for r in repartidores:
+        carga = (
+            db.query(TrackingORM)
+            .filter(
+                TrackingORM.driver_id == r.id,
+                TrackingORM.status.in_(ESTADOS_ACTIVOS),
+            )
+            .count()
+        )
+
+        if (menor_carga is None) or (carga < menor_carga):
+            menor_carga = carga
+            mejor_repartidor = r
+
+    if mejor_repartidor is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No se pudo determinar un repartidor para asignar."
+        )
+
+    # 4) Crear o actualizar el tracking para este pedido
+    if tracking is None:
+        tracking = TrackingORM(
+            order_id=order.id,
+            status="Repartidor asignado",
+            driver_id=mejor_repartidor.id,
+            updated_at=datetime.now(),
+        )
+        db.add(tracking)
+    else:
+        tracking.driver_id = mejor_repartidor.id
+        if tracking.status in ["En preparación", "Listo para retiro"]:
+            tracking.status = "Repartidor asignado"
+        tracking.updated_at = datetime.now()
+
+    db.commit()
+    db.refresh(tracking)
+
+    return mejor_repartidor
+
 
 # --- 1. MODELOS DE DATOS (DTOs Y ENTIDADES DE TUS 27 DIAGRAMAS) ---
 
@@ -179,11 +254,29 @@ class OrderSummary(BaseModel):
 
     class Config:
         orm_mode = True
+###############################################################################
+# --- Modelo de respuesta para actualizar estado de tracking --- 
+class TrackingStatusDriver(BaseModel):
+    id: str
+    name: str
+    phone: str
+
+
+class TrackingStatusResponse(BaseModel):
+    orderId: str
+    status: str
+    updatedAt: datetime
+    driver: Optional[TrackingStatusDriver]
+
+
 # --- Página "Mis pedidos" ---
 class MyOrderItem(BaseModel):
     productName: str
     quantity: int
     price: float
+
+    class Config:
+        orm_mode = True
 
 
 class MyOrderSummary(BaseModel):
@@ -198,12 +291,13 @@ class MyOrderSummary(BaseModel):
         orm_mode = True
 
 
-
+# --- Personalización de pedidos ---
 class OrderPersonalizationInput(BaseModel):
     # userId se obtendrá del token
     spiceLevel: str
     extras: List[str]
     notes: str
+
 
 class OrderPreference(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -211,6 +305,10 @@ class OrderPreference(BaseModel):
     spiceLevel: str
     extras: List[str]
     notes: str
+
+    class Config:
+        orm_mode = True
+
 
 # --- Diagrama 08: Filtrar y Buscar ---
 class SearchFilterInput(BaseModel):
@@ -220,37 +318,48 @@ class SearchFilterInput(BaseModel):
     maxPrice: Optional[Decimal] = None
     sortBy: Optional[str] = None
 
+
 # --- Diagrama 09: Registro de Pedidos ---
 class OrderItemInput(BaseModel):
     productId: UUID
     quantity: int
 
+
 class OrderInput(BaseModel):
     items: List[OrderItemInput]
     notes: Optional[str] = None
 
+
 class Order(BaseModel):
+    """
+    Esquema Pydantic para representar pedidos a nivel de API.
+    Este es el modelo que usamos en response_model de los endpoints.
+    """
     id: UUID = Field(default_factory=uuid4)
     userId: UUID
     items: List[OrderItemInput]
     notes: Optional[str] = None
     status: str = "pendiente"
     createdAt: datetime = Field(default_factory=datetime.now)
+
+    class Config:
+        orm_mode = True   # si quieres, más adelante lo cambiamos a from_attributes = True
+
+
 class OrderHistoryItem(BaseModel):
     id: UUID
     date: datetime
     description: str
     pointsEarned: int
 
-# Lista para almacenar pedidos (simulado)
-orders: List[Order] = []
 
 # --- Diagrama 10: Integracion Pasarela de Pago ---
 class PaymentGatewayInput(BaseModel):
     orderId: UUID
     amount: Decimal
     provider: str
-    token: str # Token de la tarjeta
+    token: str  # Token de la tarjeta
+
 
 class PaymentGateway(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -259,10 +368,15 @@ class PaymentGateway(BaseModel):
     status: str
     amount: Decimal
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 11: Confirmacion Automatica de Pago ---
 class PaymentConfirmationInput(BaseModel):
     orderId: UUID
     gatewayTransactionId: str
+
 
 class Payment(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -271,10 +385,15 @@ class Payment(BaseModel):
     authorizationCode: str
     confirmedAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 12: Generacion de Boletas Digitales ---
 class DigitalInvoiceInput(BaseModel):
     orderId: UUID
     amount: Decimal
+
 
 class Invoice(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -284,10 +403,15 @@ class Invoice(BaseModel):
     pdfUrl: str
     generatedAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 13: Envio de Boletas por Correo ---
 class SendInvoiceEmailInput(BaseModel):
     invoiceId: UUID
     email: str
+
 
 class InvoiceDispatch(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -296,9 +420,14 @@ class InvoiceDispatch(BaseModel):
     sentAt: datetime = Field(default_factory=datetime.now)
     status: str
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 14: Panel Control Cocina ---
 class KitchenPanelInput(BaseModel):
-    status: str # ej. "Pendiente", "EnPreparacion"
+    status: str  # ej. "Pendiente", "EnPreparacion"
+
 
 class KitchenTicket(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -307,13 +436,15 @@ class KitchenTicket(BaseModel):
     startedAt: Optional[datetime] = None
     readyAt: Optional[datetime] = None
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 15: Alertas de Tiempos de Coccion ---
 class CookingTimeAlertInput(BaseModel):
     ticketId: UUID
     thresholdMinutes: int
-class TrackingUpdateInput(BaseModel):
-    orderId: UUID
-    status: str  # ejemplo: "en ruta", "cerca", "entregado"
+
 
 class CookingAlert(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -321,11 +452,21 @@ class CookingAlert(BaseModel):
     thresholdMinutes: int
     triggeredAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True
+
+
+class TrackingUpdateInput(BaseModel):
+    orderId: UUID
+    status: str  # ejemplo: "en ruta", "cerca", "entregado"
+
+
 # --- Diagrama 16: Notificacion al Cliente ---
 class CustomerNotificationInput(BaseModel):
     userId: UUID
     title: str
     message: str
+
 
 class Notification(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -334,13 +475,58 @@ class Notification(BaseModel):
     message: str
     sentAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 17: Asignacion Automatica de Repartidores ---
 # --- Tracking con repartidor ---
+# --- Modelos para Panel de Repartidor ---
+
+class AutoAssignmentResponse(BaseModel):
+    orderId: str
+    driverId: str
+    status: str
+
+
+class DriverOrderItem(BaseModel):
+    productName: str
+    quantity: int
+    price: float
+
+    class Config:
+        orm_mode = True
+
+
+class DriverOrder(BaseModel):
+    orderId: str
+    customerName: Optional[str] = None
+    total: float
+    status: str
+    createdAt: datetime
+    items: List[DriverOrderItem]
+
+    class Config:
+        orm_mode = True
+
 
 class DriverInfo(BaseModel):
     id: str
     name: str
     phone: Optional[str] = None
+
+class AssignedOrderResponse(BaseModel):
+    """
+    Respuesta para la asignación automática de repartidor:
+    devuelve el pedido + info del repartidor asignado.
+    """
+    id: str
+    userId: str
+    total: float
+    status: str
+    createdAt: datetime
+    driver: Optional[DriverInfo] = None
+
 
 
 class TrackingResponse(BaseModel):
@@ -352,8 +538,10 @@ class TrackingResponse(BaseModel):
     class Config:
         from_attributes = True   # (equivalente a orm_mode = True)
 
+
 class AutoDriverAssignmentInput(BaseModel):
     orderId: UUID
+
 
 class Assignment(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -362,10 +550,15 @@ class Assignment(BaseModel):
     assignedAt: datetime = Field(default_factory=datetime.now)
     status: str
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 18: Planificacion de Rutas ---
 class RoutePlanningInput(BaseModel):
     date: datetime
     orders: List[UUID]
+
 
 class RoutePlan(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -374,9 +567,14 @@ class RoutePlan(BaseModel):
     optimizedBy: str
     createdAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True
+
+
 # --- Diagrama 19: Panel de Repartidor ---
 class CourierPanelInput(BaseModel):
     driverId: UUID
+
 
 class CourierAssignmentView(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -385,11 +583,21 @@ class CourierAssignmentView(BaseModel):
     status: str
     updatedAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True
+
+
+# --- Diagrama 20: Seguimiento del Pedido ---
 # --- Diagrama 20: Seguimiento del Pedido ---
 class OrderTrackingInput(BaseModel):
     orderId: UUID
 
+
 class Tracking(BaseModel):
+    """
+    Esquema Pydantic para tracking que usamos en response_model.
+    OJO: No choca con TrackingORM, porque ese viene importado con alias.
+    """
     id: UUID = Field(default_factory=uuid4)
     orderId: UUID
     status: str
@@ -397,7 +605,11 @@ class Tracking(BaseModel):
     lng: Optional[float] = None
     updatedAt: datetime = Field(default_factory=datetime.now)
 
+    class Config:
+        orm_mode = True   # si quieres, más adelante lo cambiamos a from_attributes = True
 
+
+#########################################################################
 
 # --- Diagrama 21: Acumular Puntos por Compras ---
 class PurchaseHistoryItem(BaseModel):
@@ -545,19 +757,6 @@ def crear_token_verificacion_email(email: str) -> str:
         expires_delta=timedelta(minutes=30)
     )
 
-
-
-# --- 4. "BASE DE DATOS" (temporal, en memoria) ---
-db_customers: List[Customer] = []
-email_verification_tokens: dict[UUID, str] = {}
-password_recovery_codes: dict[str, str] = {}
-db_orders: List[Order] = []
-db_payments: List[Payment] = []
-db_invoices: List[Invoice] = []
-db_kitchen_tickets: List[KitchenTicket] = []
-db_trackings: List[Tracking] = []
-db_loyalty_points: List[LoyaltyPoints] = []
-# ... (y así para las 27 entidades)
 
 
 # --- 5. FUNCIONES DE AUTENTICACIÓN Y BBDD ---
@@ -1026,9 +1225,6 @@ def set_order_personalization(
     )
 
 
-# BD simulada:
-orders: List[Order] = []
-
 
 @app.post(f"{API_PREFIX}/pedidos/registro", response_model=Order, tags=["PedidoService"])
 def register_order(
@@ -1452,52 +1648,165 @@ def get_tracking(
         driver=driver_info
     )
 
+# --- Panel Repartidor: listar pedidos asignados ---
 
-
-@app.post(f"{API_PREFIX}/reparto/asignacion-automatica", response_model=Response, tags=["OperacionesService"])
-def assign_driver(
-    input: AutoDriverAssignmentInput,
+@app.get(f"{API_PREFIX}/repartidores/{{driver_id}}/pedidos",
+         response_model=List[DriverOrder],
+         tags=["DeliveryPanel"])
+def get_driver_orders(
+    driver_id: str,
     db: Session = Depends(get_db)
 ):
     """
-    (Diagrama 17) Asignación Automática de Repartidores (MySQL).
-    Asigna un repartidor real al pedido y actualiza el tracking.
+    Devuelve los pedidos asignados a un repartidor dado (driver_id),
+    con su estado actual y el detalle de ítems.
     """
-    # 1) Buscar tracking del pedido
-    tracking_orm = (
+    # 1) Buscar todos los trackings de ese repartidor
+    trackings = (
         db.query(TrackingORM)
-        .filter(TrackingORM.order_id == str(input.orderId))
+        .filter(TrackingORM.driver_id == driver_id)
+        .order_by(TrackingORM.updated_at.desc())
+        .all()
+    )
+
+    resultado: List[DriverOrder] = []
+
+    for tr in trackings:
+        order = db.query(OrderORM).filter(OrderORM.id == tr.order_id).first()
+        if not order:
+            continue
+
+        # Cliente (puede ser None)
+        customer = db.query(CustomerORM).filter(
+            CustomerORM.id == order.user_id
+        ).first()
+
+        items_db = (
+            db.query(OrderItemORM)
+            .filter(OrderItemORM.order_id == order.id)
+            .all()
+        )
+
+        items_pydantic: List[DriverOrderItem] = [
+            DriverOrderItem(
+                productName=item.product_name,
+                quantity=item.quantity,
+                price=float(item.price or 0),
+            )
+            for item in items_db
+        ]
+
+        resultado.append(
+            DriverOrder(
+                orderId=str(order.id),
+                customerName=customer.name if customer else None,
+                total=float(order.total or 0),
+                status=tr.status,
+                createdAt=order.created_at,
+                items=items_pydantic,
+            )
+        )
+
+    return resultado
+class DriverUpdateStatusInput(BaseModel):
+    status: str   # "En preparación", "En camino", "Entregado", etc.
+
+
+@app.post(f"{API_PREFIX}/repartidores/pedidos/{{order_id}}/status",
+          response_model=TrackingStatusResponse,
+          tags=["DeliveryPanel"])
+def driver_update_order_status(
+    order_id: str,
+    data: DriverUpdateStatusInput,
+    db: Session = Depends(get_db)
+):
+    """
+    Permite al repartidor actualizar el estado del pedido.
+    (Ej: En camino -> Entregado)
+    """
+    tracking = (
+        db.query(TrackingORM)
+        .filter(TrackingORM.order_id == order_id)
         .order_by(TrackingORM.updated_at.desc())
         .first()
     )
 
-    if not tracking_orm:
-        raise HTTPException(status_code=404, detail="Tracking no encontrado para ese pedido")
+    if not tracking:
+        raise HTTPException(status_code=404, detail="Tracking no encontrado")
 
-    # 2) Buscar repartidores
-    drivers = db.query(DeliveryPersonORM).all()
-    if not drivers:
-        raise HTTPException(status_code=400, detail="No hay repartidores registrados")
-
-    # 3) Elegir uno al azar
-    chosen_driver = random.choice(drivers)
-
-    # 4) Actualizar tracking
-    tracking_orm.driver_id = chosen_driver.id
-    tracking_orm.status = "Asignado"
-    tracking_orm.updated_at = datetime.now()
-
+    tracking.status = data.status
+    tracking.updated_at = datetime.now()
     db.commit()
-    db.refresh(tracking_orm)
+    db.refresh(tracking)
 
-    # 5) Devolver info
-    return Response(
-        data={
-            "orderId": tracking_orm.order_id,
-            "driverId": chosen_driver.id,
-            "driverName": chosen_driver.name,
-            "status": tracking_orm.status,
-        }
+    driver_data = None
+    if tracking.driver_id:
+        driver = db.query(DeliveryPersonORM).filter(
+            DeliveryPersonORM.id == tracking.driver_id
+        ).first()
+        if driver:
+            driver_data = {
+                "id": str(driver.id),
+                "name": driver.name,
+                "phone": driver.phone,
+            }
+
+    return TrackingStatusResponse(
+        orderId=str(tracking.order_id),
+        status=tracking.status,
+        updatedAt=tracking.updated_at,
+        driver=driver_data,
+    )
+from fastapi import Depends
+from database import get_db
+# o el schema que uses para devolver pedidos
+
+@app.post(
+    f"{API_PREFIX}/repartidores/asignar-automatico/{{order_id}}",
+    response_model=AssignedOrderResponse,
+    tags=["RepartidorService"],
+)
+def asignar_repartidor_endpoint(order_id: str, db: Session = Depends(get_db)):
+    """
+    (Diagrama XX) Asignación automática de repartidor para un pedido.
+
+    - Busca el pedido por ID
+    - Selecciona el mejor repartidor disponible
+    - Asigna el repartidor
+    - Retorna el pedido actualizado con info del repartidor
+    """
+    # 1) Buscar la orden
+    order_db = db.query(OrderORM).filter(OrderORM.id == order_id).first()
+    if not order_db:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+    # 2) Validar estado (opcional)
+    if order_db.status in ["Entregado", "Cancelado"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se puede asignar repartidor a un pedido con estado '{order_db.status}'.",
+        )
+
+    # 3) Asignar repartidor automáticamente (usa tu función de antes)
+    repartidor = asignar_repartidor_automatico(db, order_db)
+
+    # 4) Armar objeto DriverInfo
+    driver_info = None
+    if repartidor:
+        driver_info = DriverInfo(
+            id=repartidor.id,
+            name=repartidor.name,
+            phone=repartidor.phone,
+        )
+
+    # 5) Retornar el pedido + info del repartidor asignado
+    return AssignedOrderResponse(
+        id=str(order_db.id),
+        userId=str(order_db.user_id),
+        total=float(order_db.total),
+        status=order_db.status,
+        createdAt=order_db.created_at,
+        driver=driver_info,
     )
 
 

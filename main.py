@@ -138,6 +138,7 @@ def asignar_repartidor_automatico(db: Session, order: OrderORM) -> DeliveryPerso
     return mejor_repartidor
 
 
+
 # --- 1. MODELOS DE DATOS (DTOs Y ENTIDADES DE TUS 27 DIAGRAMAS) ---
 
 # --- Modelo de Respuesta Genérico ---
@@ -552,6 +553,26 @@ class Assignment(BaseModel):
 
     class Config:
         orm_mode = True
+
+# --- Modelos para Panel de Cocina ---
+
+class KitchenOrderItem(BaseModel):
+    productName: str
+    quantity: int
+    price: float
+
+
+class KitchenOrder(BaseModel):
+    id: str
+    customerName: str
+    status: str
+    createdAt: datetime
+    total: float
+    items: List[KitchenOrderItem]
+
+    class Config:
+        from_attributes = True  # o orm_mode = True si sigues en v1
+
 
 
 # --- Diagrama 18: Planificacion de Rutas ---
@@ -1508,53 +1529,138 @@ def search_products(filter_input: SearchFilterInput = Depends()):
 
 # --- Servicio: Operaciones (Diagramas 14, 15, 17, 18, 19, 20) ---
 
-@app.get(f"{API_PREFIX}/cocina/panel-control", response_model=List[KitchenTicket], tags=["OperacionesService"])
-def get_kitchen_panel(status: str):
-    """
-    (Diagrama 14) Panel Control Cocina.
-    Usa Query Params: ?status=Pendiente
-    """
-    print(f"Buscando tickets de cocina con estado: {status}")
-    # Lógica de BBDD (Simulada)
-    tickets = [t for t in db_kitchen_tickets if t.status == status]
-    return tickets
-# --- Servicio: Cocina ---
-@app.post(f"{API_PREFIX}/cocina/ticket", tags=["KitchenService"], response_model=KitchenTicket)
-def generate_kitchen_ticket(
-    input: DigitalInvoiceInput,   # solo usamos orderId
-    current_customer: Customer = Depends(get_current_customer)
+from typing import Optional
+
+@app.get(
+    f"{API_PREFIX}/cocina/panel-control",
+    response_model=List[KitchenOrder],
+    tags=["CocinaService"],
+)
+def get_kitchen_panel(
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
 ):
     """
-    (Diagrama 15) Generación de Ticket de Cocina.
-    Endpoint protegido.
+    (Diagrama 14) Panel Control Cocina - AHORA usando MySQL.
+
+    - Si se pasa ?status=..., filtra por ese estado.
+    - Si no se pasa, muestra los pedidos 'activos' para cocina.
     """
 
-    # 1) Verificar que el pedido exista y pertenezca al cliente actual
-    order = get_order_for_customer(input.orderId, current_customer.id)
-    if order is None:
-        raise HTTPException(status_code=404, detail="Pedido no encontrado para este cliente")
-
-    # 2) Verificar si YA EXISTE ticket de cocina
-    existing_ticket = next(
-        (t for t in db_kitchen_tickets if t.orderId == input.orderId),
-        None
+    query = (
+        db.query(OrderORM)
+        .join(CustomerORM, CustomerORM.id == OrderORM.user_id)
     )
 
-    if existing_ticket:
-        print(f"[DEBUG] Ticket de cocina ya existe para pedido {input.orderId}")
-        return existing_ticket
+    # Si el frontend manda un estado específico, lo usamos
+    if status:
+        query = query.filter(OrderORM.status == status)
+    else:
+        # Estados "activos" para la cocina
+        query = query.filter(
+            OrderORM.status.in_(["En preparación", "Listo para retiro"])
+        )
 
-    # 3) Crear ticket nuevo
-    ticket = KitchenTicket(
-        orderId=input.orderId,
-        status="en preparación"
+    orders_db = query.order_by(OrderORM.created_at.asc()).all()
+
+    resultado: List[KitchenOrder] = []
+
+    for o in orders_db:
+        items = [
+            KitchenOrderItem(
+                productName=item.product_name,
+                quantity=item.quantity,
+                price=float(item.price),
+            )
+            for item in o.items
+        ]
+
+        total = float(o.total) if o.total is not None else sum(
+            it.price * it.quantity for it in items
+        )
+
+        resultado.append(
+            KitchenOrder(
+                id=o.id,
+                customerName=o.customer.name if o.customer else "Cliente",
+                status=o.status,
+                createdAt=o.created_at,
+                total=total,
+                items=items,
+            )
+        )
+
+    return resultado
+
+
+
+class KitchenTicketInput(BaseModel):
+    orderId: UUID
+
+
+@app.post(
+    f"{API_PREFIX}/cocina/ticket",
+    response_model=KitchenOrder,
+    tags=["CocinaService"],
+)
+def generate_kitchen_ticket(
+    input: KitchenTicketInput,
+    db: Session = Depends(get_db),
+    current_customer: CustomerORM = Depends(get_current_customer),
+):
+    """
+    (Diagrama 15) Generación / activación de Ticket de Cocina usando MySQL.
+
+    - Verifica que el pedido exista y pertenezca al cliente actual.
+    - Cambia el estado a 'En preparación' si aún no lo está.
+    - Devuelve el pedido en el formato del Panel de Cocina.
+    """
+
+    order_db = (
+        db.query(OrderORM)
+        .filter(
+            OrderORM.id == str(input.orderId),
+            OrderORM.user_id == current_customer.id,
+        )
+        .first()
     )
 
-    db_kitchen_tickets.append(ticket)
+    if not order_db:
+        raise HTTPException(
+            status_code=404,
+            detail="Pedido no encontrado para este cliente",
+        )
 
-    print(f"[DEBUG] Ticket generado para pedido {input.orderId}: {ticket.id}")
+    # Si el pedido está en estado inicial, lo pasamos a 'En preparación'
+    if order_db.status not in ["En preparación", "Listo para retiro"]:
+        order_db.status = "En preparación"
+        db.add(order_db)
+        db.commit()
+        db.refresh(order_db)
 
-    return ticket
+    # Construir respuesta tipo KitchenOrder
+    items = [
+        KitchenOrderItem(
+            productName=item.product_name,
+            quantity=item.quantity,
+            price=float(item.price),
+        )
+        for item in order_db.items
+    ]
+
+    total = float(order_db.total) if order_db.total is not None else sum(
+        it.price * it.quantity for it in items
+    )
+
+    return KitchenOrder(
+        id=order_db.id,
+        customerName=current_customer.name,
+        status=order_db.status,
+        createdAt=order_db.created_at,
+        total=total,
+        items=items,
+    )
+
 
 @app.post(f"{API_PREFIX}/cocina/alertas-coccion", response_model=Response, tags=["OperacionesService"])
 def set_cooking_alert(input: CookingTimeAlertInput):

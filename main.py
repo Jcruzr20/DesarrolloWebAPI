@@ -279,20 +279,17 @@ class MyOrderItem(BaseModel):
     quantity: int
     price: float
 
-    class Config:
-        orm_mode = True
-
 
 class MyOrderSummary(BaseModel):
     id: str
     date: datetime
-    description: str
-    total: float
     status: str
+    total: float
     items: List[MyOrderItem]
 
     class Config:
-        orm_mode = True
+        from_attributes = True
+
 
 
 # --- Personalización de pedidos ---
@@ -635,7 +632,6 @@ class CourierAssignmentView(BaseModel):
         orm_mode = True
 
 
-# --- Diagrama 20: Seguimiento del Pedido ---
 # --- Diagrama 20: Seguimiento del Pedido ---
 class OrderTrackingInput(BaseModel):
     orderId: UUID
@@ -1418,7 +1414,64 @@ def get_order_by_id(
         status=status,
         createdAt=order_db.created_at
     )
-@app.get(f"{API_PREFIX}/clientes/me/mis-pedidos", response_model=List[MyOrderSummary], tags=["PedidoService"])
+@app.get(
+    f"{API_PREFIX}/pedidos/mis",
+    response_model=List[MyOrderSummary],
+    tags=["PedidoService"]
+)
+def get_my_orders(
+    db: Session = Depends(get_db),
+    current_customer: CustomerORM = Depends(get_current_customer),
+):
+    """
+    (Mis pedidos)
+    Devuelve todos los pedidos del cliente autenticado,
+    ordenados del más reciente al más antiguo.
+    """
+
+    orders = (
+        db.query(OrderORM)
+        .filter(OrderORM.user_id == current_customer.id)
+        .order_by(OrderORM.created_at.desc())
+        .all()
+    )
+
+    resultado = []
+
+    for o in orders:
+        items = [
+            MyOrderItem(
+                productName=item.product_name,
+                quantity=item.quantity,
+                price=float(item.price),
+            )
+            for item in o.items
+        ]
+
+        descripcion = (
+            f"{len(items)} producto(s)"
+            if len(items) > 1
+            else items[0].productName
+        )
+
+        resultado.append(
+            MyOrderSummary(
+                id=o.id,
+                date=o.created_at,
+                description=descripcion,
+                total=float(o.total),
+                status=o.status,
+                items=items,
+            )
+        )
+
+    return resultado
+
+@app.get(
+    f"{API_PREFIX}/clientes/me/mis-pedidos",
+    response_model=List[MyOrderSummary],
+    tags=["PedidoService"],
+)
 def get_my_orders_with_status(
     current_customer: CustomerORM = Depends(get_current_customer),
     db: Session = Depends(get_db),
@@ -1437,12 +1490,12 @@ def get_my_orders_with_status(
     result: List[MyOrderSummary] = []
 
     for order in orders:
-        # Relación con Tracking (uselist=False)
+        # Relación con Tracking
         status = "Desconocido"
         if order.tracking:
             status = order.tracking.status or "Sin estado"
 
-        # Ítems del pedido
+        # Ítems
         items_data: List[MyOrderItem] = []
         for item in order.items:
             items_data.append(
@@ -1453,7 +1506,7 @@ def get_my_orders_with_status(
                 )
             )
 
-        # Descripción
+        # Descripción “bonita”
         if order.items:
             first_name = order.items[0].product_name
             if len(order.items) == 1:
@@ -1475,10 +1528,105 @@ def get_my_orders_with_status(
         )
 
     return result
+# Estados en los que NO se permite cancelar
+ESTADOS_NO_CANCELABLES = [
+    "En camino",
+    "Entregado",
+    "Cancelado",
+    "Listo para retiro",
+]
 
 
+@app.post(
+    f"{API_PREFIX}/clientes/me/mis-pedidos/{{order_id}}/cancelar",
+    response_model=MyOrderSummary,
+    tags=["PedidoService"],
+)
+def cancelar_mi_pedido(
+    order_id: str,
+    current_customer: CustomerORM = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """
+    Cancela un pedido del cliente actual, si todavía es cancelable.
+    - Solo puede cancelar su propio pedido.
+    - No se puede cancelar si ya está En camino / Entregado / Cancelado / Listo para retiro.
+    - Actualiza el estado del pedido a 'Cancelado'.
+    - Registra el cambio también en TRACKING.
+    """
 
+    # 1) Buscar el pedido y validar que sea del cliente actual
+    order_db = (
+        db.query(OrderORM)
+        .filter(
+            OrderORM.id == order_id,
+            OrderORM.user_id == current_customer.id,
+        )
+        .first()
+    )
 
+    if not order_db:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado para este cliente")
+
+    # 2) Validar si es cancelable
+    if order_db.status in ESTADOS_NO_CANCELABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se puede cancelar un pedido con estado '{order_db.status}'.",
+        )
+
+    # 3) Cambiar estado del pedido
+    order_db.status = "Cancelado"
+    db.add(order_db)
+
+    # 4) Registrar en TRACKING (opcional pero bonito para el seguimiento)
+    last_tracking = (
+        db.query(TrackingORM)
+        .filter(TrackingORM.order_id == order_id)
+        .order_by(TrackingORM.updated_at.desc())
+        .first()
+    )
+
+    nuevo_tracking = TrackingORM(
+        order_id=order_id,
+        status="Cancelado",
+        # si tenía repartidor asignado lo copiamos, si no, queda None
+        driver_id=last_tracking.driver_id if last_tracking else None,
+        updated_at=datetime.now(),
+    )
+    db.add(nuevo_tracking)
+
+    db.commit()
+    db.refresh(order_db)
+
+    # 5) Reconstruir MyOrderSummary SOLO para este pedido (misma lógica que en get_my_orders_with_status)
+    items_data: List[MyOrderItem] = []
+    for item in order_db.items:
+        items_data.append(
+            MyOrderItem(
+                productName=item.product_name,
+                quantity=item.quantity,
+                price=float(item.price or 0),
+            )
+        )
+
+    if order_db.items:
+        first_name = order_db.items[0].product_name
+        if len(order_db.items) == 1:
+            description = first_name
+        else:
+            description = f"{first_name} + {len(order_db.items) - 1} ítem(s) más"
+    else:
+        description = "Pedido sin ítems"
+
+    return MyOrderSummary(
+        id=str(order_db.id),
+        date=order_db.created_at,
+        description=description,
+        total=float(order_db.total or 0),
+        status=order_db.status,   # ahora 'Cancelado'
+        items=items_data,
+    )
 
 # -----------------------------
 # PAYMENT SERVICE (Diagrama 10)

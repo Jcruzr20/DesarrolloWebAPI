@@ -58,6 +58,9 @@ app.add_middleware(
 
 ESTADOS_ACTIVOS = ["En preparación", "Listo para retiro", "En reparto"]
 
+KITCHEN_ACTIVE_STATUSES = ["En preparación", "Listo para retiro"]
+
+
 
 def asignar_repartidor_automatico(db: Session, order: OrderORM) -> DeliveryPersonORM:
     """
@@ -573,6 +576,30 @@ class KitchenOrder(BaseModel):
     class Config:
         from_attributes = True  # o orm_mode = True si sigues en v1
 
+class KitchenTicketInput(BaseModel):
+    orderId: UUID
+class KitchenStatusUpdate(BaseModel):
+    status: str
+
+# --- Tracking para cliente (Perfil / Seguimiento) ---
+
+class TrackingStep(BaseModel):
+    code: str       # ej. "en_cocina"
+    label: str      # ej. "En cocina"
+    done: bool      # si ese paso ya está cumplido
+
+
+class OrderTrackingResponse(BaseModel):
+    orderId: str
+    customerName: str
+    total: float
+    status: str                 # estado actual de la ORDEN
+    steps: List[TrackingStep]
+    driverName: Optional[str] = None
+    driverPhone: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 
 # --- Diagrama 18: Planificacion de Rutas ---
@@ -1528,8 +1555,21 @@ def search_products(filter_input: SearchFilterInput = Depends()):
     ])
 
 # --- Servicio: Operaciones (Diagramas 14, 15, 17, 18, 19, 20) ---
-
 from typing import Optional
+
+COCINA_ESTADOS_VALIDOS = [
+    "En cocina",
+    "En preparación",
+    "Listo para retiro",
+]
+
+TRACKING_ESTADOS = [
+    "En cocina",
+    "En preparación",
+    "Listo para retiro",
+    "En camino",
+    "Entregado",
+]
 
 @app.get(
     f"{API_PREFIX}/cocina/panel-control",
@@ -1556,9 +1596,9 @@ def get_kitchen_panel(
     if status:
         query = query.filter(OrderORM.status == status)
     else:
-        # Estados "activos" para la cocina
+        # Estados "activos" para la cocina (usamos la constante)
         query = query.filter(
-            OrderORM.status.in_(["En preparación", "Listo para retiro"])
+            OrderORM.status.in_(COCINA_ESTADOS_VALIDOS)
         )
 
     orders_db = query.order_by(OrderORM.created_at.asc()).all()
@@ -1591,6 +1631,65 @@ def get_kitchen_panel(
         )
 
     return resultado
+
+@app.patch(
+    f"{API_PREFIX}/cocina/estado/{{order_id}}",
+    tags=["CocinaService"],
+    response_model=KitchenOrder
+)
+def update_kitchen_status(
+    order_id: str,
+    input: KitchenStatusUpdate,
+    db: Session = Depends(get_db)
+):
+    """
+    Permite que la cocina cambie el estado de un pedido.
+    Estados válidos:
+    - En cocina
+    - En preparación
+    - Listo para retiro
+    """
+
+    nuevo_estado = input.status
+
+    if nuevo_estado not in COCINA_ESTADOS_VALIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Estado inválido: {nuevo_estado}. Estados permitidos: {COCINA_ESTADOS_VALIDOS}"
+        )
+
+    order_db = db.query(OrderORM).filter(OrderORM.id == order_id).first()
+
+    if not order_db:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+    # Actualizar estado
+    order_db.status = nuevo_estado
+    db.commit()
+    db.refresh(order_db)
+
+    # Construir respuesta tipo KitchenOrder
+    items = [
+        KitchenOrderItem(
+            productName=item.product_name,
+            quantity=item.quantity,
+            price=float(item.price),
+        )
+        for item in order_db.items
+    ]
+
+    total = float(order_db.total) if order_db.total is not None else sum(
+        it.price * it.quantity for it in items
+    )
+
+    return KitchenOrder(
+        id=order_db.id,
+        customerName=order_db.customer.name,
+        status=order_db.status,
+        createdAt=order_db.created_at,
+        total=total,
+        items=items,
+    )
 
 
 
@@ -1914,6 +2013,68 @@ def asignar_repartidor_endpoint(order_id: str, db: Session = Depends(get_db)):
         createdAt=order_db.created_at,
         driver=driver_info,
     )
+from typing import List
+
+
+@app.get(
+    f"{API_PREFIX}/repartidores/pedidos-asignados/{{driver_id}}",
+    response_model=List[KitchenOrder],
+    tags=["RepartidorService"],
+)
+def get_assigned_orders_for_driver(
+    driver_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Lista de pedidos asignados a un repartidor (para el Panel de Repartidor).
+
+    - Usa la tabla tracking para ver qué pedidos tiene asignados ese driver_id.
+    - Toma el estado desde tracking.status (Repartidor asignado, En ruta, Entregado, etc.)
+    """
+
+    # Trackings de ese repartidor, en estados "activos" para él
+    trackings = (
+        db.query(TrackingORM)
+        .join(OrderORM, TrackingORM.order_id == OrderORM.id)
+        .join(CustomerORM, CustomerORM.id == OrderORM.user_id)
+        .filter(
+            TrackingORM.driver_id == driver_id,
+            TrackingORM.status.in_(["Repartidor asignado", "En ruta"])
+        )
+        .order_by(OrderORM.created_at.asc())
+        .all()
+    )
+
+    resultado: List[KitchenOrder] = []
+
+    for tr in trackings:
+        o = tr.order  # relación TrackingORM.order
+
+        items = [
+            KitchenOrderItem(
+                productName=item.product_name,
+                quantity=item.quantity,
+                price=float(item.price),
+            )
+            for item in o.items
+        ]
+
+        total = float(o.total) if o.total is not None else sum(
+            it.price * it.quantity for it in items
+        )
+
+        resultado.append(
+            KitchenOrder(
+                id=o.id,
+                customerName=o.customer.name if o.customer else "Cliente",
+                status=tr.status,          # 👈 estado desde tracking
+                createdAt=o.created_at,
+                total=total,
+                items=items,
+            )
+        )
+
+    return resultado
 
 
 @app.post(f"{API_PREFIX}/reparto/planificacion-rutas", response_model=Response, tags=["OperacionesService"])

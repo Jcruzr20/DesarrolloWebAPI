@@ -226,6 +226,9 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 # --- Diagrama 05: Recuperar Contrasena --- 
+class PasswordChangeInput(BaseModel):
+    currentPassword: str
+    newPassword: str
 class PasswordRecoveryInput(BaseModel):
     email: str
 
@@ -1132,7 +1135,30 @@ def get_my_profile(current_customer: CustomerORM = Depends(get_current_customer)
         points=current_customer.points,   # 👈 AQUÍ SUMAMOS LOS PUNTOS
     )
 
+@app.post(f"{API_PREFIX}/clientes/me/password", tags=["UserService"])
+def change_my_password(
+    input: PasswordChangeInput,
+    current_customer: CustomerORM = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    """
+    Cambiar contraseña del cliente logueado.
+    """
+    # Usa la misma lógica que en /auth/login para verificar la contraseña actual
+    if not pwd_context.verify(input.currentPassword, current_customer.hashed_password):
+        raise HTTPException(status_code=400, detail="La contraseña actual no es correcta.")
 
+    # Aquí podrías volver a validar complejidad si quieres (opcional)
+    # if not es_password_segura(input.newPassword):
+    #     raise HTTPException(status_code=400, detail="La nueva contraseña no cumple los requisitos.")
+
+    # Hashear nueva contraseña y guardar
+    current_customer.hashed_password = hashear_contraseña(input.newPassword)
+    db.add(current_customer)
+    db.commit()
+    db.refresh(current_customer)
+
+    return {"message": "Contraseña actualizada correctamente."}
 
 
 @app.put(f"{API_PREFIX}/cuenta/gestion", response_model=Response, tags=["UserService"])
